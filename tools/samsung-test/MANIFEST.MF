@@ -1,0 +1,7 @@
+Manifest-Version: 1.0
+MIDlet-Name: SamsungTest
+MIDlet-Version: 1.0.0
+MIDlet-Vendor: j2me-nx-port
+MIDlet-1: SamsungTest, , SamsungTest
+MicroEdition-Configuration: CLDC-1.1
+MicroEdition-Profile: MIDP-2.0
