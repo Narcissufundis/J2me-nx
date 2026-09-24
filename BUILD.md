@@ -35,8 +35,8 @@ cd ..
 node tools/build-classes.mjs
 ```
 
-- 需要 JDK 8；如果 `javac` 不在默认位置，用环境变量指定：
-  - Windows：`set JDK_BIN=D:\jdk1.8.0_281\bin`
+- 需要 JDK 8；`JDK_BIN` 未设时会依次回落到 `JAVA_HOME\bin` 与默认安装位置，也可以直接指定：
+  - Windows：`set JDK_BIN=<JDK 8 安装目录>\bin`
   - Linux/macOS：`JDK_BIN=/usr/lib/jvm/java-8-openjdk/bin node tools/build-classes.mjs`
 - 产物：`java/classes.jar` 与 `data/java/classes.jar`（脚本会做字节码终验，补丁没进包会直接报错退出）。
 
@@ -75,9 +75,55 @@ npm run nro
 ```
 
 产出 `dist/J2me-nx.nro`，并打印大小与 sha256（发版说明直接用这个哈希）。
-`npm run nsp` 打 NSP；`npm run release` 等价于 `npm run nro`。
+同时会出一份**带版本戳**的同内容产物 `dist/J2me-nx-<构建标记>.nro`（实机拷这份，名字自带版本，
+不会再和旧包混淆），并在游戏列表右下角显示 `build <构建标记>`。
+`npm run release` 等价于 `npm run nro`。
 
-### 7. 回归测试
+### 7. NSP（装成标题，application 模式）
+
+```bash
+npm run nsp
+```
+
+产出 `dist/J2me-nx.nsp`（≈49MB，**slim 形态**）+ `dist/nxjs-v1.0.0-beta.6.nro`（共享运行时），
+并自动跑 `tools/verify-nsp.mjs` 自检结构。
+
+- **安装**：用你惯用的标题安装器（DBI / Goldleaf / Awoo 等）安装 `J2me-nx.nsp`；
+  然后把 `nxjs-v1.0.0-beta.6.nro` 放到 SD 卡的 **`sdmc:/nx.js/`** 目录（文件名里的版本必须
+  与构建时注入的 `[runtime] version` 一致，脚本会保证这点），从主页启动即可。
+- **为什么不能打 fat**：`--fat` 会把**官方未打补丁的运行时**作为 exefs/main 内嵌进去，
+  而本项目的 `data/nxjs.ini` 是 `jit = on`（需要打过 W^X 补丁的 `runtime_jitfix`，
+  见 `data/nxjs.ini` 里的历史注释）→ 官方运行时在 Switch 上分配 JIT 代码页即 `Data Abort`，
+  **启动就报错**（这正是之前"装了 NSP 直接报错"的原因）。slim 用 SD 上那份打过补丁的运行时，
+  JIT 照常可用；如果你确实要发 fat，就必须把 `nxjs.ini` 的 `jit` 改成 `off`。
+- 好处：从主页启动是 **application 模式**（内存约 3GB、GPU 画布），比 hbmenu 的 applet 模式
+  （约 425MB、CPU 光栅）快得多 —— 日志里 `[heap] bootlim:` 会从"偏紧档 425MB"变成"正常档 821MB"。
+
+### 7.5 NRO 前端 NSP（只做启动器，用 NTON）
+
+如果你只想要"主页能点开、以 application 模式启动 SD 上那个 NRO"，不必打 49MB 的 NSP，
+用 [NTON](https://github.com/rlaphoenix/NTON) 生成一个 **NRO→NSP 前端**即可（≈322KB）：
+
+```bash
+python -m pip install nton
+python -m nton build "dist/J2me-nx.nro" \
+  --sdmc "/switch/J2me-nx.nro" \
+  -n "J2me-nx" -p "Narcissufundis" -v "1.0.0" \
+  -i "tools/icon-source.png"
+```
+
+- 产物落到桌面的 `NTON/` 目录（文件名带 Title ID），本项目已收一份到
+  `dist/forwarder/J2me-nx-forwarder.nsp`（Title ID `01edecb97ac45000`）。
+- 用 `--sdmc` 指定的路径是**硬编码**的：NRO 必须一直在 `sdmc:/switch/J2me-nx.nro`，
+  改名或挪走前端就会报"找不到文件"。带版本戳的 `J2me-nx-<标记>.nro` 只用于 hbmenu 测试。
+- 这份前端也**需要** SD 上的共享运行时（`sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro`），
+  因为跑起来的仍是我们的 NRO，它按自己的 `nxjs.ini` 去加载运行时。
+- 验收：装好后从主页启动，日志应出现 `[heap] bootlim:` **正常档 821MB** 与
+  `[boot] 形态=NRO-独立`；若仍是"偏紧档 425MB"，说明这次是被 hbmenu 启动的（applet 模式）。
+- 自检：`node tools/verify-nsp.mjs dist/forwarder/J2me-nx-forwarder.nsp`
+  （脚本会识别出 forwarder 形态，不会拿 romfs 大小去误判成 fat）。
+
+### 8. 回归测试
 
 ```bash
 npm test
@@ -93,8 +139,27 @@ npm test
 3. 从 homebrew 菜单启动 **J2me-nx**；
 4. 首次运行会在 `sdmc:/switch/j2me-nx/` 下自动生成配置与日志。
 
-### 9. 关键注意（最容易踩的三个坑）
+### 8.5 只用官方运行时构建（不需要打过补丁的 nx.js）
 
+`data/nxjs.ini` 默认是 `[v8] jit = on`，它**要求运行时带 W^X 补丁**（官方运行时配 `jit=on`
+在 Switch 上分配 JIT 代码页即 `Data Abort`）。我们的**发版二进制自带**那份补丁运行时
+（`dist/nxjs-v1.0.0-beta.6.nro`，见 `NOTICE.md`），但如果你是从源码构建、手上只有官方运行时，
+加一个环境变量即可生成"官方运行时也能启动"的 romfs：
+
+```bash
+J2ME_STOCK_RUNTIME=1 node tools/package.mjs     # → romfs/nxjs.ini 里的 [v8] jit 自动改成 off
+npm run nro                                     # 之后照常打包
+```
+
+代价是 JS 侧没有 V8 JIT（整体明显更慢，但能跑）。Windows PowerShell 写法：
+
+```powershell
+$env:J2ME_STOCK_RUNTIME='1'; node tools/package.mjs; Remove-Item Env:J2ME_STOCK_RUNTIME
+```
+
+不设这个变量时行为与以前完全一致（`jit = on` + 需要补丁运行时）。
+
+### 9. 关键注意（最容易踩的三个坑）
 1. **运行时 JIT**：本移植默认 `data/nxjs.ini` 里 `[v8] jit = on`，这要求运行时**带 JIT 内存写权限补丁**
    （原版 nx.js 运行时会因为 W^X 限制在分配代码页时 Data Abort 崩溃）。
    如果你 `npm install` 拿到的是官方运行时，请把 `data/nxjs.ini` 改成：
@@ -139,8 +204,9 @@ Dependencies are declared in `tools/package.json` (`@nx.js/nro`, `@nx.js/nsp`, `
 node tools/build-classes.mjs
 ```
 
-- Requires JDK 8. Point the script at it with `JDK_BIN` when it is not in the default location:
-  - Windows: `set JDK_BIN=D:\jdk1.8.0_281\bin`
+- Requires JDK 8. When `JDK_BIN` is unset the script falls back to `JAVA_HOME\bin` and then to the
+  default install location; it can also be pointed at explicitly:
+  - Windows: `set JDK_BIN=<JDK 8 install dir>\bin`
   - Linux/macOS: `JDK_BIN=/usr/lib/jvm/java-8-openjdk/bin node tools/build-classes.mjs`
 - Output: `java/classes.jar` and `data/java/classes.jar`. The script verifies the bytecode
   afterwards and exits with an error if a patch did not make it into the jar.
@@ -182,9 +248,60 @@ npm run nro
 ```
 
 Produces `dist/J2me-nx.nro` and prints its size and sha256 (use that hash in release notes).
-`npm run nsp` builds an NSP; `npm run release` is an alias for `npm run nro`.
+It also emits a **version-stamped copy** `dist/J2me-nx-<build-marker>.nro` (copy that one to the
+console — its name tells you which build it is), and the game list shows `build <marker>` in the
+bottom-right corner. `npm run release` is an alias for `npm run nro`.
 
-### 7. Run the regression suite
+### 7. NSP (installed title, application mode)
+
+```bash
+npm run nsp
+```
+
+Produces `dist/J2me-nx.nsp` (~49 MB, always **slim**) plus `dist/nxjs-v1.0.0-beta.6.nro`
+(the shared runtime), and runs `tools/verify-nsp.mjs` to sanity-check the structure.
+
+- **Install**: install `J2me-nx.nsp` with your title installer (DBI / Goldleaf / Awoo), then put
+  `nxjs-v1.0.0-beta.6.nro` into **`sdmc:/nx.js/`** (the version in the filename must match the
+  `[runtime] version` injected at build time — the script guarantees this), and launch from the
+  home menu.
+- **Never build it fat**: `--fat` embeds the **official, unpatched runtime** as `exefs/main`, while
+  this project's `data/nxjs.ini` uses `jit = on` (it needs the W^X-patched `runtime_jitfix` — see the
+  historical notes in `data/nxjs.ini`). On the Switch the official runtime dies with `Data Abort`
+  when allocating JIT code pages, i.e. it **errors out immediately at launch** — exactly what
+  happened to the earlier NSP attempt. Slim loads the patched runtime from the SD card and keeps JIT.
+  If you really want a fat NSP, set `jit = off` in `nxjs.ini` first.
+- Benefit: launching from the home menu runs in **application mode** (~3 GB memory, GPU canvas),
+  far faster than hbmenu's applet mode (~425 MB, CPU raster) — the log's `[heap] bootlim:` line
+  changes from "偏紧档 425MB" to "正常档 821MB".
+
+### 7.5 NRO forwarder NSP (launcher only, via NTON)
+
+If all you want is "tap it on the home menu and have it launch that NRO from the SD card in
+application mode", you don't need the 49 MB NSP — generate an **NRO→NSP forwarder** with
+[NTON](https://github.com/rlaphoenix/NTON) instead (≈322 KB):
+
+```bash
+python -m pip install nton
+python -m nton build "dist/J2me-nx.nro" \
+  --sdmc "/switch/J2me-nx.nro" \
+  -n "J2me-nx" -p "Narcissufundis" -v "1.0.0" \
+  -i "tools/icon-source.png"
+```
+
+- The output lands in `NTON/` on your desktop (filename carries the Title ID); this repo keeps a
+  copy at `dist/forwarder/J2me-nx-forwarder.nsp` (Title ID `01edecb97ac45000`).
+- The `--sdmc` path is **hardcoded**: the NRO must stay at `sdmc:/switch/J2me-nx.nro`. Rename or
+  move it and the forwarder reports a missing file. Stamped `J2me-nx-<tag>.nro` copies are only for
+  launching through hbmenu.
+- The forwarder still **needs** the shared runtime at `sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro`: what
+  actually runs is our NRO, and it loads the runtime according to its own `nxjs.ini`.
+- Acceptance: launch it from the home menu — the log should show `[heap] bootlim:` **正常档 821MB**
+  and `[boot] 形态=NRO-独立`. Still seeing "偏紧档 425MB" means it was launched from hbmenu (applet mode).
+- Self-check: `node tools/verify-nsp.mjs dist/forwarder/J2me-nx-forwarder.nsp` (the script
+  recognises the forwarder shape instead of misjudging it as fat using romfs sizes).
+
+### 8. Run the regression suite
 
 ```bash
 npm test
@@ -200,6 +317,22 @@ panel layout, UI language, and packaged-artifact self-checks. **No console requi
 2. Put game `.jar` files into `sdmc:/switch/java/`;
 3. Launch **J2me-nx** from the homebrew menu;
 4. On first run, configuration files and logs are created under `sdmc:/switch/j2me-nx/`.
+
+### 8.5 Building against the stock (unpatched) runtime
+
+`data/nxjs.ini` ships `[v8] jit = on`, which **requires a W^X-patched runtime** (the official
+runtime aborts with `Data Abort` when allocating JIT code pages with `jit=on`). Our released
+binaries include that patched runtime (`dist/nxjs-v1.0.0-beta.6.nro`, see `NOTICE.md`); if you
+build from source and only have the official runtime, one environment variable gives you a
+romfs that boots on it:
+
+```bash
+J2ME_STOCK_RUNTIME=1 node tools/package.mjs     # flips [v8] jit to off in romfs/nxjs.ini
+npm run nro
+```
+
+The trade-off is no V8 JIT for the JavaScript side (noticeably slower, but it runs). Without the
+variable the behaviour is unchanged (`jit = on`, patched runtime required).
 
 ### 9. The three most common pitfalls
 

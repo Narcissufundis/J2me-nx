@@ -40,8 +40,44 @@ try { unlinkSync(src); } catch (e) { /* 根目录那份删不掉也不影响 */ 
 
 const size = statSync(dst).size;
 const sha = createHash('sha256').update(readFileSync(dst)).digest('hex').toUpperCase();
+
+// PATCH(perfZ26)：**同时**出一份带版本戳的文件名 dist/J2me-nx-<标记>.nro。
+// 由来：实机反馈"重启还是中文"时，日志里的 build 标记显示跑的其实是两轮前的旧包
+// （用户手上 SD 卡里那份同名文件到底是哪一版，光看文件名分不出来）。
+// 带戳的名字 + 稳定名两份，既方便实机辨认/回滚（多份可共存），发布仍用稳定名。
+let stamped = null;
+{
+  const src = readFileSync(path.join(ROOT, 'app', 'main.js'), 'utf8');
+  const m = /build=([0-9A-Za-z._-]+)/.exec(src);
+  if (m) {
+    const tag = m[1].replace(/^\d{8}-/, '');   // 20260924-perfZ26-persist → perfZ26-persist
+    stamped = `J2me-nx-${tag}.${ext}`;
+    copyFileSync(dst, path.join(outDir, stamped));
+  }
+}
+
 console.log('');
 console.log('  ' + pkg.nacp?.title + ' v' + pkg.version + '  (' + (pkg.author || '?') + ')');
 console.log('  产物: dist/' + outName + '  ' + size + ' B  (' + (size / 1048576).toFixed(2) + ' MB)');
+if (stamped) console.log('  带戳: dist/' + stamped + '  （同哈希，实机上靠它认版本）');
 console.log('  sha256: ' + sha);
+// PATCH(perfZ28)：打 NSP 时把**打过补丁的共享运行时**一并放到 dist/。
+// slim NSP 的 forwarder 会去 sdmc:/nx.js/nxjs-v<[runtime] version>.nro 找运行时；
+// 官方那份没打 W^X 补丁，配 jit = on 会启动即 Data Abort —— 所以必须给这份打过补丁的，
+// 且文件名里的版本要和 builder 注入的 [runtime] version 完全一致（否则扫描不到）。
+if (ext === 'nsp') {
+  try {
+    const nspPkg = JSON.parse(readFileSync(path.join(ROOT, 'tools/node_modules/@nx.js/nsp/package.json'), 'utf8'));
+    const rtSrc = path.join(ROOT, 'tools/node_modules/@nx.js/nro/dist/nxjs.nro');
+    if (existsSync(rtSrc)) {
+      const rtName = 'nxjs-v' + nspPkg.version + '.nro';
+      copyFileSync(rtSrc, path.join(outDir, rtName));
+      console.log('  共享运行时: dist/' + rtName + '（打好补丁的那份，装 NSP 时放到 SD 的 /nx.js/ 下）');
+    } else {
+      console.log('  ⚠ 找不到共享运行时 ' + rtSrc + '（slim NSP 将无法启动）');
+    }
+  } catch (e) { console.log('  ⚠ 共享运行时拷贝失败: ' + e.message); }
+}
+
+console.log('  自检: 开机日志首行应打印 build=' + (/build=([0-9A-Za-z._-]+)/.exec(readFileSync(path.join(ROOT, 'app', 'main.js'), 'utf8')) || [])[1]);
 console.log('');

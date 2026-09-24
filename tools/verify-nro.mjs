@@ -59,7 +59,10 @@ rows.push('');
 
 // ---- host 脚本是否都在（漏拷一次就少个功能） ----
 const HOST = ['switch-input.js', 'mask-scan.js', 'png-decoder.js', 'switch-audio.js',
-  'idb-shim.js', 'pipe-host.js', 'env-prelude.js', 'ui-lang.js'];
+  'idb-shim.js', 'pipe-host.js', 'env-prelude.js', 'ui-lang.js',
+  // perfZ26：读盘类型规整（ArrayBuffer → Uint8Array）。漏拷 = 语言/按键映射/按键机型
+  // 三个落盘功能在实机上静默失效（实机读回的是 ArrayBuffer，没有 .length）。
+  'bytes.js'];
 rows.push('--- host 脚本 ---');
 for (const h of HOST) rows.push(`  ${h.padEnd(20)} ${count('host/' + h) > 0 ? '在' : '缺失!'}`);
 

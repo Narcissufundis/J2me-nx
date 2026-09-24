@@ -1,10 +1,10 @@
 # 第三方组件与未随包分发的资产 / Third-party components and non-bundled assets
 
-> 这份文件是**给发布者看的合规清单**：哪些东西是别人的、什么许可证、哪些资产故意没进包、
-> 以及上线前建议处理的事项。请连同 `README.md` / `BUILD.md` 一起保留。
-> This file is the compliance checklist for whoever publishes this repository: what belongs to
-> others, under which license, which assets are deliberately not included, and what to fix
-> before going public. Keep it together with `README.md` / `BUILD.md`.
+> 这份文件是**第三方组件与资产清单**：哪些东西是别人的、各自什么许可证、哪些资产故意没进包，
+> 以及仓库维护上需要知道的事实。请连同 `README.md` / `BUILD.md` / `RUNTIME.md` 一起保留。
+> This file is the third-party component and asset inventory: what belongs to others, under which
+> license, which assets are deliberately not included, and the facts needed to maintain this
+> repository. Keep it together with `README.md` / `BUILD.md` / `RUNTIME.md`.
 
 ---
 
@@ -14,10 +14,10 @@
 |---|---|---|---|
 | PluotSorbet（J2ME 虚拟机，JS） | [mozilla/pluotsorbet](https://github.com/mozilla/pluotsorbet) | GPL-2.0（含 Classpath 例外的 Java 部分） | `vendor/pluotsorbet/**`；本移植在其上打了补丁（补丁点都在代码里用 `PATCH(j2me-nx-port)` 标注） |
 | phoneME / CLDC-HI 类库源码 | Sun / Oracle（`phoneME` 项目） | GPL-2.0 + Classpath 例外 | `java/cldc1.1.1/**`、`java/midp/**`；与 GPL-2.0-or-later 兼容 |
-| 预编译类 `java/prebuilt-classes/**` | phoneME（如 `GBK_Reader`） | GPL-2.0 + Classpath 例外 | ⚠️ **见 §4 待办 1**：这些是二进制 class，仓库里没有对应源码 |
+| 预编译类 `java/prebuilt-classes/**` | phoneME（如 `GBK_Reader`） | GPL-2.0 + Classpath 例外 | 8 个二进制 class，仓库内没有对应源码；构建 `classes.jar` 时注入，详见 §4 |
 | nx.js 运行时 | [TooTallNate/nx.js](https://github.com/TooTallNate/nx.js) | MIT | 由 `npm install` 获取（`tools/node_modules`），本仓库不附带其二进制；移植文档里描述的 JIT 内存补丁属于"构建时的本地修改" |
 | 字体 `data/fonts/cjk.ttf` | [Noto Sans SC](https://github.com/google/fonts/tree/main/ofl/notosanssc)（Adobe + Google，由 Source Han Sans 派生） | **SIL Open Font License 1.1** | 上游可变字体 `NotoSansSC[wght].ttf` 用 fontTools 实例化成静态 Regular（`wght=400`）。保留字体名（RFN）是 `Source`，本字体未使用该名。版权/许可信息保留在字体内部，许可证全文见 `data/fonts/OFL-NotoSansSC.txt`（打包后是 romfs 的 `fonts/OFL.txt`）。`fsType=0`，允许再分发 |
-| 遮罩素材 `data/mask.raw` | 由本项目处理生成 | 视原始图片来源而定 | ⚠️ **见 §4 待办 2** |
+| 遮罩素材 `data/mask.raw` | 由本项目处理生成（1280×720 RGBA 裸数据） | 视原始图片来源而定 | 再分发前请确认原始图片的权利归属，见 §3 |
 | 遮罩素材 `data/masks/*.raw` | 本项目自绘 / 自行生成 | 随本仓库许可证 | 8 张可选遮罩 |
 
 **字体变更说明（1.0.0 起）**：1.0.0 之前的版本内置 SimHei，其 `OS/2.fsType = 8`
@@ -62,20 +62,23 @@ commercially.
 
 ---
 
-## 4. 上线前建议处理（待办）/ Suggested TODOs before publishing
+## 4. 维护说明 / Repository maintenance notes
 
-1. **`java/prebuilt-classes/**` 的源码**：这些 class 从 phoneME 取来但没有随仓库带源码。
-   GPL 要求分发二进制时提供对应源码 —— 建议从 phoneME 仓库取回对应 `.java` 放进 `java/custom/`
-   并从源码编译（可以顺手让 `tools/build-classes.mjs` 的注入步骤变成可选）。
-   Source for `java/prebuilt-classes/**`: these classes came from phoneME without their sources.
-   Since GPL requires corresponding source for distributed binaries, fetch the upstream `.java`
-   files into `java/custom/` and compile them from source.
-2. **`data/mask.raw` 的图片出处**：确认可再分发，或换一张自制图（1280×720 RGBA 裸数据）。
-   Confirm the provenance of the default mask image, or replace it with your own
-   (1280×720 raw RGBA).
-3. **`release/` 下的文档模板**：改完记得重跑 `node tools/make-publish.mjs` 覆盖到发布目录。
-   If you edit the templates in `release/`, re-run `node tools/make-publish.mjs`.
-4. **开发日志**：`PERF-修复记录-perfA-perfB.md`（中文，记录了每一处补丁的原因与实测数据）
-   默认会随快照复制；如果不希望公开，从 `tools/make-publish.mjs` 的根文件清单里去掉它。
-   The development log (Chinese) is copied into the snapshot by default; remove it from the
-   file list in `tools/make-publish.mjs` if you don't want it public.
+- `release/` 下的这些模板是公开发布文档的**唯一来源**；改完模板后重跑 `node tools/make-publish.mjs`
+  即可刷新发布快照（该脚本会打印进了包与没进包的清单）。
+  The templates under `release/` are the single source of the published documents; after editing them,
+  re-run `node tools/make-publish.mjs` to refresh the snapshot (it prints the included and the excluded
+  file lists).
+- `java/prebuilt-classes/**` 里有 8 个**没有随仓库携带源码**的编译产物
+  （`com/sun/cldc/i18n/j2me/` 下的中文与西欧编码读写器，以及
+  `com/sun/midp/l10n/LocalizedStrings_zh_CN`），构建 `classes.jar` 时注入；`classes.jar` 里其余的
+  class 全部由 `java/` 下的源码现编。删除该目录即可得到完全由源码构建的 `classes.jar`
+  （受影响的编码会回落到仓库内的实现）。
+  `java/prebuilt-classes/**` holds eight compiled classes **whose sources are not in this repository**
+  (the Chinese and Western-European i18n readers under `com/sun/cldc/i18n/j2me/`, plus
+  `com/sun/midp/l10n/LocalizedStrings_zh_CN`); they are injected while `classes.jar` is built.
+  Every other class in `classes.jar` is compiled from the sources under `java/`; removing that
+  directory yields a fully source-built `classes.jar` (the affected encodings then fall back to the
+  in-repo implementations).
+- 运行时的 JIT 补丁说明见 `RUNTIME.md`。
+  The runtime's JIT patch is documented in `RUNTIME.md`.

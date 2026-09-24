@@ -75,7 +75,7 @@ node tools/simulate.mjs
 ## 重新编译
 
 ```powershell
-$jdk='D:\j2me\jdk1.8.0_281\bin'
+$jdk="$env:JAVA_HOME\bin"          # 或改成你的 JDK 8 安装目录下的 bin，或用 $env:JDK_BIN
 $env:Path="$jdk;$env:Path"
 cd tools\textinput-test
 javac -nowarn -Xlint:none -source 1.3 -target 1.3 -cp ..\..\java\classes.jar TextTest.java

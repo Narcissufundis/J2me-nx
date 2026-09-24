@@ -1123,13 +1123,40 @@ var emoji = (function() {
 
   var squareSize = 16;
 
+  // PATCH(j2me-nx-port perfZ38)：**emoji 精灵图不随包分发**，所以"假装支持"是有害的。
+  //
+  // 事故（2026-09-24 轩辕剑-天之痕，实机 error.log）：
+  //   ① 游戏画了一段含 emoji 区字符（U+1F3xx 等，诺基亚机型常用）的文本；
+  //   ② drawString 走 emoji 分支 → c.drawImage(images[sheet], ...)；
+  //   ③ 而 images[i] 的 src 是 "style/emoji/emojiN.png" —— 这 12 张图**不在我们的 romfs 里**，
+  //      宿主 env-prelude 的 Image shim 对这类路径"延迟触发 onload"（为了让 onload 流程不挂死），
+  //      于是 Promise.all 立刻 resolve、`emoji.loaded = true`，但那个 Image **没有任何解码产物**
+  //      （既没有原生 _bitmap 也没有 _decoded）；
+  //   ④ Skia 的 drawImage 拿到这种对象直接抛 `Error: Image or Canvas expected`，
+  //      异常穿过 `Graphics.drawString` 的 native 冒到游戏里 → 游戏的绘制/初始化线程挂掉 →
+  //      **永远画不出第一帧**（实机 `[enter] 20s 未出首帧`、drawTick 冻住），看起来就是"卡死"。
+  //
+  // 处理：本包明确声明**不支持 emoji 绘制**——
+  //   · regEx 换成永不匹配，drawString/measureWidth 一律按普通文本处理（缺字形顶多是豆腐块）；
+  //   · loadData() 立刻 resolve（gainedForeground0 不再等待不存在的图）；
+  //   · getData() 返回 img=null，调用方必须能容忍（gfx.js 里也加了兜底）。
+  // 若将来真把 12 张精灵图放进 romfs，把 SUPPORTED 改成 true 即可恢复原行为。
+  var EMOJI_SUPPORTED = false;
+  var NEVER_MATCH = /$^/g;
+
   return {
-    regEx: new RegExp(regexString, 'g'),
+    regEx: EMOJI_SUPPORTED ? new RegExp(regexString, 'g') : NEVER_MATCH,
+
+    // 供 gfx.js / 宿主判断（drawString 里用它做最后一道闸）
+    supported: EMOJI_SUPPORTED,
 
     squareSize: squareSize,
 
-    loaded: false,
+    loaded: !EMOJI_SUPPORTED,
     loadData: function() {
+      if (!EMOJI_SUPPORTED) {
+        return Promise.resolve();
+      }
       var promises = [];
 
       for (var i = 0; i < 13; i++) {
@@ -1148,6 +1175,8 @@ var emoji = (function() {
 
         promises.push(new Promise(function(resolve, reject) {
           images[i].onload = resolve;
+          // perfZ38：缺图/加载失败也要 settle —— 否则 gainedForeground0 会永久挂起
+          images[i].onerror = resolve;
         }));
       }
 
@@ -1170,6 +1199,12 @@ var emoji = (function() {
       }
 
       var emoji = data[unified];
+
+      // perfZ38：查不到或者是"不支持 emoji"模式 → 明确返回 img=null，
+      // 调用方（gfx.js drawString）据此回落到普通文本绘制，**绝不把 undefined 交给 drawImage**。
+      if (!emoji || !images[emoji.sheet]) {
+        return { img: null, x: 0 };
+      }
 
       return {
         img: images[emoji.sheet],

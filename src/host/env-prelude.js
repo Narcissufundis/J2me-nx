@@ -498,6 +498,9 @@
     this.onload = null;
     this.onerror = null;
     this.complete = false;
+    // PATCH(perfZ38)：标记"这是我家的 Image shim"，供宿主 drawImage 兜底闸门识别
+    // （见 app/main.js：无解码产物时跳过绘制，而不是让 Skia 抛异常把游戏线程带走）。
+    this.__j2meImageShim = true;
     // 解码产物二选一：
     //   _bitmap  = runtime 原生 ImageBitmap（首选，drawImage 直接吃）
     //   _decoded = { width, height, data(Uint8Array RGBA) } 纯 JS 回落

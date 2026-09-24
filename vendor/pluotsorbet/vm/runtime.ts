@@ -1195,6 +1195,79 @@ module J2ME {
   var pendingCompiles: MethodInfo [] = [];
   var pendingCompileSet: any = {};
 
+  /**
+   * PATCH(perfZ34)：**只排队、不编译**的编译请求入口。
+   *
+   * 由来（实机事故）：perfZ33 的"热点定向编译"是**在解释器内部同步调用**
+   * `compileAndLinkMethod` 的（采样钩子跑在 interpretBody 的热路径上，每 10s 触发一次、
+   * 一次最多 8 个方法）—— 等于在游戏帧中间做 8 次 Relooper 代码生成，既造成长停顿，
+   * 也在紧档（V8 堆上限 ~404MB、Java 堆 RAB 只有 32MB）下把 V8 推到大分配失败的那条路上
+   * （历史上"自己退出"就是这个形态：日志没有任何 [exit] 行就断掉）。
+   * 现在改成：热点榜只把方法**排进既有队列**，真正的编译一律由宿主在场间隙
+   * `drainCompileQueue(6)` 里做（那里有 maxMs 上限、一次一个、天然错开游戏帧）。
+   */
+  export function requestCompile(methodInfo: MethodInfo): void {
+    if (!enableRuntimeCompilation || !methodInfo) {
+      return;
+    }
+    if (methodInfo.state !== MethodState.Cold) {
+      return;
+    }
+    // PATCH(perfZ35): 排队入口也要挡上限——否则队列里会堆一批"注定不会编"的方法，
+    // 每帧 drain 反复 pop/push 白烧时间（实机日志里 待编译 一直是 0，就是因为 drain 很快，
+    // 但上限没生效时队列会以另一种方式持续吃编译时间）。
+    if (!jitCompileBudgetLeft()) {
+      return;
+    }
+    var pk = methodInfo.implKey;
+    if (pendingCompileSet[pk]) {
+      return;   // 已在队列里
+    }
+    pendingCompileSet[pk] = true;
+    pendingCompiles.push(methodInfo);
+  }
+
+  // PATCH(perfZ35): 编译上限判定（供编译入口与排队入口共用）。
+  var jitCapLogged = false;
+  function jitCompileBudgetLeft(): boolean {
+    var cap = ConfigThresholds.JitCompileCap | 0;
+    if (cap <= 0) return true;                       // 0/负数 = 不限制（off 档本来就不编）
+    if (compiledMethodCount < cap) return true;
+    if (!jitCapLogged) {
+      jitCapLogged = true;
+      if (jsGlobal && jsGlobal.__sdMark) {
+        jsGlobal.__sdMark("[jit-cap] 已达本会话编译上限 " + cap + " 个方法，停止编译" +
+          "（已编译=" + compiledMethodCount + " 累计=" + totalJITTime.toFixed(0) + "ms）——" +
+          "想多编请重开（或删掉 sdmc:/switch/j2me-nx/jit-big 彻底关掉 JIT）");
+      }
+    }
+    return false;
+  }
+
+  // PATCH(perfZ35): 编译前后各留一条现场（含宿主探针的 V8 堆/原生内存数字）。
+  // 由来：perfZ32~Z34 的静默退出后面总是紧跟着一次编译，但日志里看不到"编译当时的堆"，
+  // 无法判断是不是编译期分配把运行时推下悬崖。宿主通过 jsGlobal.__jitMemProbe 提供数字。
+  function jitMemProbeText(): string {
+    try {
+      if (jsGlobal && typeof jsGlobal.__jitMemProbe === "function") {
+        var s = jsGlobal.__jitMemProbe();
+        return s ? " " + s : "";
+      }
+    } catch (eProbe) { /* 探针故障不干扰编译 */ }
+    return "";
+  }
+
+  export function pendingCompileCount(): number {
+    return pendingCompiles.length;
+  }
+
+  // PATCH(perfZ35): 还剩几个编译名额（-1 = 不限制）。给 int.ts 的热点采样器判"该不该再排队"。
+  export function jitCompileRemaining(): number {
+    var cap = ConfigThresholds.JitCompileCap | 0;
+    if (cap <= 0) return -1;
+    return cap - compiledMethodCount;
+  }
+
   function compileBudgetAvailable(): boolean {
     // 帧间隙 drain 上下文自带 maxMs 上限，不受秒级预算限制
     if (compileDrainDepth > 0) {
@@ -1254,6 +1327,15 @@ module J2ME {
     if (maxCompiledMethodCount >= 0 && compiledMethodCount >= maxCompiledMethodCount) {
       return;
     }
+    // PATCH(perfZ35): 本会话硬上限（唯一总闸）——所有触发路径都过这里。
+    if (!config.forceRuntimeCompilation && !jitCompileBudgetLeft()) {
+      return;
+    }
+    // PATCH(perfZ35): tier=big 只编 ≥512B 的方法（其余交给采样器按热点决定）。
+    if (ConfigThresholds.JitBigOnly && !config.forceRuntimeCompilation &&
+        methodInfo.codeAttribute && methodInfo.codeAttribute.code.length < 512) {
+      return;
+    }
     // Don't compile methods that are too large.
     // 2026-09-22 法拉利GT3 根因：上游 4000 字节上限把最热渲染方法
     // a.e(IIIIII)V（4524 字节）拒之门外 → 终生走解释器 → 重场景 8~14fps。
@@ -1310,6 +1392,16 @@ module J2ME {
         " size=" + methodInfo.codeAttribute.code.length);
     }
 
+    // PATCH(perfZ35): 编译前现场（含宿主探针）。静默退出前的最后一次编译就是嫌疑点，
+    // 所以这里必须留下"编的是谁、多大、当时堆多少"。
+    var jitPreProbe = jitMemProbeText();
+    if (jsGlobal && jsGlobal.__sdMark) {
+      jsGlobal.__sdMark("[jit-pre] #" + (compiledMethodCount + 1) + " " + methodInfo.implKey +
+        " size=" + (methodInfo.codeAttribute ? methodInfo.codeAttribute.code.length : -1) +
+        " calls=" + methodInfo.stats.interpreterCallCount +
+        " bb=" + methodInfo.stats.backwardsBranchCount + jitPreProbe);
+    }
+
     jitWriter && jitWriter.enter("Compiling: " + compiledMethodCount + " " + methodInfo.implKey + ", interpreterCallCount: " + methodInfo.stats.interpreterCallCount + " backwardsBranchCount: " + methodInfo.stats.backwardsBranchCount + " currentBytecodeCount: " + methodInfo.stats.bytecodeCount);
     var s = performance.now();
 
@@ -1351,6 +1443,11 @@ module J2ME {
     linkMethodSource(methodInfo, compiledMethod.args, compiledMethod.body, compiledMethod.referencedClasses, compiledMethod.onStackReplacementEntryPoints);
     var methodJITTime = (performance.now() - s);
     totalJITTime += methodJITTime;
+    // PATCH(perfZ32b)：把编译开销挂到全局，供宿主心跳量化"JIT 值不值"（编译毫秒 vs 帧率收益）。
+    if (jsGlobal) {
+      jsGlobal.__jitCompileMs = (jsGlobal.__jitCompileMs || 0) + methodJITTime;
+      jsGlobal.__jitCompileN = compiledMethodCount;
+    }
     // PATCH(j2me-nx-port): 编译计费（与预算门配套；失败编译同样计费——它们也是卡顿源）；
     // 成功/失败都从 pending 集合摘除标记
     compileBudgetUsed += methodJITTime;
@@ -1360,6 +1457,16 @@ module J2ME {
     if (jsGlobal && jsGlobal.__sdMark) {
       if (methodJITTime > 30 || compiledMethodCount <= 3) {
         jsGlobal.__sdMark("[jit] #" + compiledMethodCount + " " + methodInfo.implKey + " " + methodJITTime.toFixed(1) + "ms codeSize=" + methodInfo.codeAttribute.code.length);
+      }
+      // PATCH(perfZ35): 编译后现场 —— 与 [jit-pre] 成对，一眼看出这次编译吃掉了多少堆。
+      jsGlobal.__sdMark("[jit-post] #" + compiledMethodCount + " " + methodInfo.implKey +
+        " " + methodJITTime.toFixed(1) + "ms codeSize=" + methodInfo.codeAttribute.code.length +
+        " 累计=" + totalJITTime.toFixed(0) + "ms" + jitMemProbeText());
+      // PATCH(perfZ35): 单次编译超过 60ms 或方法超过 4KB 单独标一条（历史上出事的都在这一档）。
+      if (methodJITTime > 60 || methodInfo.codeAttribute.code.length > 4000) {
+        jsGlobal.__sdMark("[jit-heavy] " + methodInfo.implKey +
+          " " + methodJITTime.toFixed(1) + "ms codeSize=" + methodInfo.codeAttribute.code.length +
+          " calls=" + methodInfo.stats.interpreterCallCount + jitPreProbe);
       }
       if (compiledMethodCount === 100 || compiledMethodCount === 500 || compiledMethodCount === 1000) {
         jsGlobal.__sdMark("[jit] milestone=" + compiledMethodCount + " totalJITTime=" + totalJITTime.toFixed(0) + "ms");
@@ -1946,6 +2053,19 @@ module J2ME {
     // PATCH(j2me-nx-port): ≥512 字节大方法的调用阈值（config/switch.js 可配）
     static InvokeThresholdBig = typeof config.invokeThresholdBig === "number" ? config.invokeThresholdBig : config.invokeThreshold;
     static BackwardBranchThreshold = config.backwardBranchThreshold;
+    // PATCH(perfZ32): 热点定向编译的每榜条数（0=关）。见 int.ts 的 maybeCompileHotspots：
+    // 不看方法大小，只编译采样器实测出来的热点方法 —— 专治"热点方法小于 512B、
+    // 大方法档碰不到它"这类游戏（UFO Afterlight 的 PointFont.DrawChar）。
+    static HotspotCompileLimit = typeof config.hotspotCompileLimit === "number" ? config.hotspotCompileLimit : 0;
+    // PATCH(perfZ35): **全会话编译方法数硬上限**（config/switch.js 按档位/内存档给值）。
+    // 由来（实机事故复核，见 PERF §42）：perfZ32~Z34 的 hot 档同时继承了 invokeThresholdBig=3，
+    // 于是"任何 ≥512B 方法被调用 3 次就编译"——两分半钟编了 29 个方法（含 9KB 的 d.a.()V，
+    // 单次 103ms），而脚本里写的"紧档每会话最多 8 个"只挡了采样器那条路，根本没管住解释器路径。
+    // 现在把上限放在**编译入口**（compileAndLinkMethod）与**排队入口**（requestCompile）两处，
+    // 无论请求来自解释器阈值、回边还是热点采样，都一起受管。
+    static JitCompileCap = typeof config.jitCompileCap === "number" ? config.jitCompileCap : -1;
+    // PATCH(perfZ35): tier=big 只编 ≥512B 的方法（默认 false = 不看大小，只按热点）。
+    static JitBigOnly = !!(jsGlobal && jsGlobal.__jitBigOnly);
   }
 
   export function monitorEnter(lock: Lock) {

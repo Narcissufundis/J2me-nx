@@ -71,6 +71,9 @@ try { if (existsSync(namesFile)) unlinkSync(namesFile); } catch (e) { /* 忽略 
 
 process.env.J2ME_TEST_GAMEDIR = gameDir;
 process.env.J2ME_TEST_MENU = '1';
+// perfZ26：仿真保真 —— 读盘结果按实机形态（ArrayBuffer）交给宿主，让"类型没规整"这类
+// 只在真机上出现的 bug 在仿真里也变红（实机 ArrayBuffer 没有 .length，Node Buffer 有）。
+process.env.J2ME_TEST_ARRAYBUFFER = '1';
 // 不设 J2ME_TEST_RESTART / J2ME_TEST_JAR
 
 // ---- stub canvas（菜单画布）----

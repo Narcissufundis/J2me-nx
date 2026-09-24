@@ -28,8 +28,10 @@ data/*.bak
 data/_adlmidi.core.test.mjs
 
 # 第三方 / 不可再分发资产（见 NOTICE.md）
-data/fonts/*.ttf
-data/fonts/*.otf
+# ⚠ 内置中文字体 data/fonts/cjk.ttf 是 Noto Sans SC（SIL OFL 1.1，fsType=0，允许再分发），
+#    **故意不再忽略**：README 承诺"字体随仓库提供、开箱即可构建"（perfZ35 修正此处不一致）。
+#    换成别的字体时，若该字体不可再分发，请把它单独加进本文件。
+data/fonts/SimHei.ttf
 data/adlmidi/*.wasm
 
 # 测试与调试的临时目录 / test scratch dirs

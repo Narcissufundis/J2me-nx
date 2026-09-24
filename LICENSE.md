@@ -16,8 +16,8 @@ This project is released under **GPL-2.0-or-later** (SPDX: `GPL-2.0-or-later`).
 
 GPL-2.0 全文请见 / The full text of GPL-2.0:
 <https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt>
-（发布到 GitHub 时建议把该文本保存为仓库根的 `LICENSE` 文件。）
-(When publishing on GitHub, save that text as `LICENSE` in the repository root.)
+本仓库以 `LICENSE.md` 保存该文本（GitHub 会识别为许可证文件）。
+This repository keeps that text as `LICENSE.md` (GitHub detects it as the licence file).
 
 ## 第三方组件 / Third-party components
 

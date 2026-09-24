@@ -1,0 +1,59 @@
+# 桌面回归 CI / Desktop regression CI
+#
+# 由来（外部评审指出，确实成立）：这个项目最有价值的资产之一是"能在 PC 上回归"的
+# 测试体系（600+ 断言 + 产物自检），但仓库里没有任何 CI，等于只靠作者本地习惯保证。
+# NRO 本身没办法在 GitHub runner 上跑，但**构建 + 全部桌面测试**都可以，所以这里做那一段。
+#
+# 注意：本 workflow 不产出可发布的 NRO（那需要打过 W^X 补丁的 nx.js 运行时，
+# 它不随仓库分发，见 NOTICE.md）。它只验证"源码 → classes.jar → bld → romfs → 测试"这条链。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  desktop-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 唯一权威依赖清单是 tools/package.json（根 package.json 刻意不再放 devDependencies）
+      - name: 安装工具链依赖 / Install toolchain deps
+        run: npm ci
+        working-directory: tools
+
+      # 编译 phoneME 类库需要 JDK 8（javac -source/-target 1.4 时代的源码树）
+      - name: JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: 编译类库 classes.jar / Build classes.jar
+        run: node tools/build-classes.mjs
+        env:
+          # setup-java 会导出 JAVA_HOME；build-classes.mjs 优先读 JDK_BIN，再读 JAVA_HOME/bin，
+          # 最后才是作者本机路径。ubuntu 上没有 .exe 后缀，脚本已按平台处理。
+          JDK_BIN: ${{ env.JAVA_HOME }}/bin
+
+      - name: 编译 VM 与宿主层 / Build VM + host bundle
+        run: node tools/build.mjs
+
+      - name: 组装 romfs / Assemble romfs
+        run: node tools/package.mjs
+
+      - name: 产物自检 / Packaged-artifact guard
+        run: node tests/packaged-artifacts.test.mjs
+
+      - name: 全套桌面回归 / Full desktop test suite
+        run: npm test

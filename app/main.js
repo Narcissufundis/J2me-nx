@@ -297,6 +297,72 @@
   // 内存。所以这不是保守，是"给多大都没用"。超出即在解码前拒绝。
   var MASK_MAX_PX = 1280 * 720;           // 921,600 像素（RGBA 3.7MB/份）
   var MASK_MAX_BYTES = 8 * 1024 * 1024;   // PNG 文件本身 ≤ 8MB
+  // PATCH(perfZ36)：**原生堆/代码空间读数**。
+  // 由来（2026-09-24 复核 §42）：两次静默退出（JIT 开/关各一次、都是偏紧档 425MB）时，
+  // 我们记的 used/total/avail/malloc **全部健康**（used≈70/94MB、peakMalloc 37MB），
+  // 死亡现场毫无征兆。而 runtime 自己的文档写明：
+  //   "Every native allocation — the V8 heap, JIT code arena, render surfaces, worker thread
+  //    stacks, ArrayBuffer backings — competes within this budget."
+  // 也就是说 nativeHeapUsed/Free/Arena 与 totalHeapSizeExecutable（可执行代码段）
+  // 才是"紧档下先耗尽"的那本账 —— 而这两项我们**从来没打过**。
+  // Switch.memoryUsage() 里这些字段本来就存在（beta6 的 MemoryUsage 接口），白放着可惜。
+  function nativeMemText() {
+    try {
+      var m = g.Switch.memoryUsage();
+      var mb = function (v) { return (typeof v === 'number') ? (v / 1048576).toFixed(1) : '?'; };
+      return ' nheap=' + mb(m.nativeHeapUsed) + '/' + mb(m.nativeHeapTotal) +
+        'MB free=' + mb(m.nativeHeapFree) +
+        ' arena=' + mb(m.nativeHeapArena) +
+        ' exec=' + mb(m.totalHeapSizeExecutable) +
+        ' ext=' + mb(m.externalMemory);
+    } catch (e) { return ' (原生读数不可用)'; }
+  }
+  // 原生余量的三道闸：<24MB 报警（10s 一次）、<16MB 或"离堆尖峰+余量偏低"触发一次防御性 GC（20s 一次）。
+  // 只管"记录 + 尽力回收"，不做任何激进动作 —— 先让下一次崩溃留下数字。
+  // perfZ37：① 阈值从 8MB 提到 16MB、并加"ext 尖峰"条件 —— 实机（perfZ36）看到
+  // `ext`（离堆 ArrayBuffer backing）在场景加载时冲到 **148.6MB**，那一刻 native free 只有 19.7MB；
+  // 本项目历史注释里记过同形态的死法（"RAB@512 把 native 吃到 645/651MB → V8 晋升分配不到 →
+  // fatal → runtime clean exit，无 crash report、日志突然断"）。所以要在**撞墙前**回收，而不是等 free<8MB。
+  // ② 也挂到 10s 心跳上（原来只在 1s 面包屑里）——开机/菜单阶段没有面包屑，正好漏掉 ext 最大的那一段。
+  var lastNmemWarn = 0;
+  var lastNmemGc = 0;
+  var lastNmemExt = 0;
+  function nativeMemGuard() {
+    try {
+      var m = g.Switch.memoryUsage();
+      if (typeof m.nativeHeapFree !== 'number') return '';
+      var freeMB = m.nativeHeapFree / 1048576;
+      var extMB = (typeof m.externalMemory === 'number') ? m.externalMemory / 1048576 : 0;
+      var now = Date.now();
+      // 离堆尖峰：一次涨 >32MB 就记一条（并带上当时的余量）——用于把"谁吃的"对上账
+      if (extMB - lastNmemExt > 32) {
+        sdLog('[nmem-spike] 离堆内存一次涨到 ' + extMB.toFixed(1) + 'MB（+' +
+          (extMB - lastNmemExt).toFixed(1) + 'MB）' + nativeMemText());
+      }
+      lastNmemExt = extMB;
+      var needGc = (freeMB < 16) || (extMB > 96 && freeMB < 32);
+      if (needGc && now - lastNmemGc > 20000) {
+        lastNmemGc = now;
+        var did = [];
+        try { if (g.ASM && g.ASM._forceCollection) { g.ASM._forceCollection(); did.push('asm'); } } catch (eG1) { /* 忽略 */ }
+        try { if (typeof globalThis !== 'undefined' && typeof globalThis.gc === 'function') { globalThis.gc(); did.push('v8'); } } catch (eG2) { /* 忽略 */ }
+        sdLog('[nmem-warn] ⚠ 原生堆余量 ' + freeMB.toFixed(1) + 'MB（临界）：已尝试回收 [' + did.join('+') + ']' + nativeMemText());
+        if (typeof __logFlush === 'function') __logFlush();
+      } else if (freeMB < 24 && now - lastNmemWarn > 10000) {
+        lastNmemWarn = now;
+        sdLog('[nmem-warn] 原生堆余量偏低 ' + freeMB.toFixed(1) + 'MB' + nativeMemText());
+      }
+      return '';
+    } catch (e) { return ''; }
+  }
+  // 2026-09-24 perfZ46：**已删除 perfZ45 的"帧落盘取证"**（dump-frames 开关 + 极简 PNG 编码器）。
+  //   原因：玩家实测模拟器性能不足以边跑游戏边做像素取证，改为直接给截图。
+  //   删掉的东西：本文件的 dumpFramePair()/dumpTimer、SCRIPTS 里的 host/png-encode.js、
+  //   启动后每 5 秒一次的存在性检查、src/host/png-encode.js 与 tests/png-encode.test.mjs。
+  //   连带好处：那条测试依赖 tools/node_modules 里的 pngjs，而 pngjs **没有**写进
+  //   tools/package.json —— CI 里 `npm ci` 之后它必然不存在，该测试会失败。删掉即消除。
+  //   拖影问题改为：实机截图 + 必要时 KEmulator/FreeJ2ME 对照（见 PERF 记录 §53）。
+
   function maskMemLine() {
     try {
       var m = g.Switch.memoryUsage();
@@ -1125,7 +1191,10 @@
     g.__uiLang.set(lang, true);   // silent：载入不写回盘（软重启每次都读，别把盘写烂）
     // 把**读到什么**一并打出来：以后"语言没固化"这类问题，看日志一眼就能定位
     // 是"文件不在"、"内容是旧值"还是"读成功但没生效"。
-    sdLog('[ui-lang] 语言=' + lang + '（' + (hit ? hit + ' 内容="' + String(raw).replace(/\s+$/, '') + '"'
+    // perfZ26：连**字节数**一起打 —— 实机上曾经因为"返回 ArrayBuffer 没有 .length"，
+    // 明明文件在也被判成"没有文件"，光看内容看不出是判空挂了，字节数一看就明白。
+    sdLog('[ui-lang] 语言=' + lang + '（' + (hit
+      ? hit + ' ' + (raw ? raw.length : 0) + '字符 内容="' + String(raw).replace(/\s+$/, '') + '"'
       : '两个候选路径都没有文件: ' + paths.join(' , ')) + '）');
     return lang;
   }
@@ -1137,6 +1206,25 @@
   function afterHostScripts() {
     // 语言先于一切 UI：菜单/错误页的任何一次绘制都要用对语言（也顺手装 onChange）
     try { loadLang(); } catch (eLang) { sdLog('[ui-lang] 载入失败: ' + (eLang && eLang.message)); }
+    // PATCH(perfZ26)：落盘类文件"到底读到了什么"必须一眼可见。
+    // 事故背景：三个功能（语言/按键映射/按键机型）在实机上全部静默失效，因为
+    // readFileSyncLocal 在实机返回 ArrayBuffer（没有 .length），调用方的判空恒假，
+    // 日志只说"没找到文件"—— 而文件其实好好躺在 SD 卡上。现在每次开机把三个文件的
+    // **存在性与字节数**打一行，判空失灵/类型不对会立刻暴露（字节数 0 或"无"）。
+    try {
+      var persist = [['lang.json', LANG_FILE], ['keys.txt', KEYS_FILE], ['keyprofiles.json', KEYPROF_FILE],
+        ['names.txt', NAMES_FILE]];
+      var report = [];
+      for (var ip = 0; ip < persist.length; ip++) {
+        var pb = readFileSyncLocal(persist[ip][1]);
+        report.push(persist[ip][0] + '=' + (pb ? '有(' + pb.length + 'B)' : '无'));
+      }
+      sdLog('[io] 落盘文件: ' + report.join(' ') + ' ｜ 读盘类型规整=' +
+        (typeof g.__toU8 === 'function' ? 'ok(__toU8)' : '缺失!(bytes.js 未加载)'));
+      if (typeof g.__toU8 === 'function' && g.__toU8ContractOk !== true) {
+        sdLog('[io] ⚠ __toU8 自检未通过：ArrayBuffer → Uint8Array 规整可能失效');
+      }
+    } catch (ePersist) { /* 诊断不干扰启动 */ }
     var sel = initMaskSel();   // 重扫 SD 遮罩（此时 g.__maskScan 才存在）
     sdLog('[mask] 启动初始化：选择=' + sel + '，SD 遮罩 ' + sdMasks.length + ' 张');
     loadKeyMap();              // 载入 keys.txt（此时 g.__keyMap 才存在）
@@ -1219,6 +1307,12 @@
     var batch = __logBuf.join('\n') + '\n';
     __logBuf.length = 0;
     if (!IS_SWITCH || !g.Switch || !g.Switch.appendFileSync) return;
+    // PATCH(perfZ38)：**同步写卡的耗时记账**。
+    // 由来：轩辕剑那次主线程被堵了 1111.4s（`[hang] 主线程阻塞 1111.4s 后恢复`），
+    // 期间 rAF/setInterval 全停、连一条 VM 采样都没有 —— 说明卡在**原生/同步调用**里，
+    // 而我们的日志落盘（appendFileSync）正是同步写 SD 的那一处。是不是它，得靠数字说话：
+    // 以后任何一次 flush 超过 1s 都会立刻落一条 [io-slow]（含毫秒数与字节数）。
+    var __t0Flush = Date.now();
     try {
       if (!__logPath) {
         try { g.Switch.mkdirSync('sdmc:/switch/j2me-nx'); } catch (e) { /* 已存在 */ }
@@ -1258,6 +1352,16 @@
       __logBuf = __logBuf.concat(batch.split('\n').filter(Boolean));
       try { console.log('[log] LOG WRITE FAILED: ' + e2); } catch (e3) { /* 忽略 */ }
     }
+    // perfZ38：慢落盘单独记账（写回缓冲，不递归调用 sdLog 以免再触发 flush）
+    try {
+      var dtFlush = Date.now() - __t0Flush;
+      if (dtFlush > 1000) {
+        __logBuf.push(new Date().toISOString().slice(11, 23) +
+          ' [io-slow] 日志落盘耗时 ' + dtFlush + 'ms（' + batch.length + 'B）——' +
+          '主线程在这段时间是被同步写卡堵住的（rAF/心跳都会停）');
+        if (!__logTimer && typeof g.setTimeout === 'function') __logTimer = g.setTimeout(__logFlush, 0);
+      }
+    } catch (eIo) { /* 忽略 */ }
   }
 
   // 追加一行日志。内部所有异常静默吞掉——日志系统绝不能引发二次崩溃。
@@ -1542,7 +1646,23 @@
       });
     } catch (e) { /* 忽略 */ }
   })();
-  sdLog('[boot] 入口加载，平台=' + (IS_SWITCH ? 'Switch' : (IS_NODE ? 'Node' : '未知')) + '，build=20260924-perfZ25-ofont');
+  sdLog('[boot] 入口加载，平台=' + (IS_SWITCH ? 'Switch' : (IS_NODE ? 'Node' : '未知')) + '，build=20260924-perfZ48-copyarea');
+  // PATCH(perfZ26)：屏显短标记（主页右下角）。**尾部必须与上面 build= 的标记一致**
+  // （tests/packaged-artifacts.test.mjs 断言两者相同）。
+  // 存在的理由很实际：玩家反馈"重启还是中文"，而日志显示设备上跑的其实是**两轮前的旧包**
+  // —— SD 卡里那个同名 NRO 到底是哪一版，光看文件名和日志都容易搞错，屏幕上写出来最省事。
+  var BUILD_TAG = 'perfZ48-copyarea';
+
+  // PATCH(perfZ27)：列表里"已改名"的标记符号。
+  // ⚠ 只能用**内置字体确有字形**的常见符号：旧标记用的是铅笔符号 U+270E，而
+  // U+270D~U+2712 这组字形在中文字体里普遍没有（旧 SimHei、新 Noto Sans SC 实测都无映射）
+  // → Skia 画 .notdef = 方块，玩家看到"游戏名后面像两个口口"。
+  // 下面这几个都是**逐字符核对过 cmap + 轮廓**（两款字体都有、非空轮廓）的常见符号，
+  // 想换风格改这一个常量即可；tests/font-coverage.test.mjs 会验证当前取值有字形。
+  //   ※ U+203B 注释号（当前）  ★ U+2605 星  ☆ U+2606 空心星  ◆ U+25C6 菱形
+  //   ● U+25CF 圆点  ▲ U+25B2 三角  · U+00B7 间隔点  ＊ U+FF0A 全角星号  * U+002A 星号
+  //   ＋ U+FF0B 全角加号  √ U+221A 勾  § U+00A7 节号  → U+2192 箭头
+  var RENAME_MARK = '※';
 
   // romfs 挂载诊断：两条读取路径各探测一次，结果落日志
   if (IS_SWITCH) {
@@ -1694,6 +1814,7 @@
 
   // [开发布局（仓库内）, romfs 布局（打包后）]
   var SCRIPTS = [
+    ['src/host/bytes.js',                      'host/bytes.js'],     // PATCH(perfZ26)：__toU8 类型规整（最早，读文件前）
     ['src/host/png-decoder.js',                 'host/png-decoder.js'],
     ['src/host/mask-scan.js',                   'host/mask-scan.js'],
     ['src/host/env-prelude.js',                 'env-prelude.js'],
@@ -1912,6 +2033,51 @@
         return verdict;
       }
       var calls = 0;
+      // PATCH(perfZ27)：**菜单文字也要过豆腐块检测**。
+      // 背景：文本探针以前只挂在 vendor 的 MIDP drawString 上（gfx.js 调它），所以只有
+      // 游戏内文字被检测；菜单/面板/游戏名是宿主自己画的，缺字形（例如 U+270E 那个铅笔标记）
+      // 在日志里完全没有痕迹，只能靠玩家对着屏幕猜。现在菜单每次重绘把**整批条目名**
+      // 交进来审一遍，缺字形立刻落 `[font-audit]` 带码位。
+      // 成本受控：isTofu 按 (字体,字符) 缓存，同一字符只算一次；每帧最多审 24 个字符。
+      var auditQ = [], auditSeen = Object.create(null), auditMiss = [], auditDone = false, auditTotal = 0;
+      g.__j2meFontAudit = function (texts, fontCss) {
+        if (auditDone) return;
+        try {
+          fontCss = String(fontCss || '30px "j2mecjk", monospace');
+          for (var t = 0; t < texts.length; t++) {
+            var s = String(texts[t] == null ? '' : texts[t]);
+            for (var i = 0; i < s.length; i++) {
+              var ch = s.charAt(i);
+              if (ch === ' ' || ch === '\n' || ch === '\r' || ch === '\t') continue;
+              var k = fontCss + '|' + ch;
+              if (auditSeen[k]) continue;
+              auditSeen[k] = 1;
+              auditQ.push([ch, fontCss]);
+            }
+          }
+        } catch (eQA) { /* 忽略 */ }
+      };
+      // 每帧消化 24 个字符（菜单重绘时调用；不占关键路径）
+      function auditStep() {
+        if (auditDone) return;
+        var n = 0;
+        while (auditQ.length && n < 24) {
+          var item = auditQ.shift(); n++;
+          auditTotal++;
+          var v = isTofu(item[1], item[0]);
+          if ((v === 'tofu' || v === 'blank') && auditMiss.length < 20) {
+            auditMiss.push('\\u' + item[0].charCodeAt(0).toString(16).toUpperCase() +
+              '(' + item[0] + ')' + (v === 'blank' ? '[空白]' : ''));
+          }
+        }
+        if (!auditQ.length) {
+          auditDone = true;
+          sdLog('[font-audit] 列表文字 ' + auditTotal + ' 字符：' +
+            (auditMiss.length ? '⚠ 缺字形 ' + auditMiss.length + ' 个 → ' + auditMiss.join(' ')
+              : '全部有字形'));
+        }
+      }
+      g.__j2meFontAuditStep = auditStep;
       g.__j2meTextSpy = function (str, fontCss, anchor) {
         calls++;
         if (calls > 40 && calls % 500 !== 0) return;
@@ -2020,6 +2186,59 @@
   }
 
   function boot() {
+    // PATCH(perfZ31/perfZ35)：**在 eval 任何 vendor 脚本之前**定 JIT 档位。
+    // config/switch.js 在自己的 IIFE 里读 jsGlobal.__jitTier 决定 VM 侧编译策略，
+    // 所以必须在脚本链开始前置好。开关是 SD 文件（与 no-throttle 同一套路）。
+    //
+    // perfZ35 改档（事故复核见 PERF §42）：**必须显式写出档位名**，认不出/空的都按 off，
+    // 并且**偏紧档（limit<700MB）一律强制 off** —— 本项目所有实机崩溃都出现在
+    // "偏紧档 + JIT" 这个组合里（收敛风险，不是已证因果）。想用 JIT 请先重开拿正常档。
+    try {
+      var jbBytes = readFileSyncLocal('sdmc:/switch/j2me-nx/jit-big');
+      var jbTxt = jbBytes ? decodeText(jbBytes).toLowerCase().replace(/\s+/g, ' ').trim() : '';
+      var jbAsk = 'off';
+      if (jbBytes) {
+        // 顺序有讲究：all ⊃ hot ⊃ osr ⊃ big；含 off 或认不出 → off（fail-safe）
+        if (jbTxt.indexOf('off') >= 0 || jbTxt === '') jbAsk = 'off';
+        else if (jbTxt.indexOf('all') >= 0) jbAsk = 'all';
+        else if (jbTxt.indexOf('hot') >= 0) jbAsk = 'hot';
+        else if (jbTxt.indexOf('osr') >= 0) jbAsk = 'bigosr';
+        else if (jbTxt.indexOf('big') >= 0) jbAsk = 'big';
+        else jbAsk = 'off';
+      }
+      // 内存档位在脚本链之前就能问到（运行时给我们的堆上限）
+      var jbLimMB = -1;
+      try { jbLimMB = g.Switch.memoryUsage().heapSizeLimit / 1048576; } catch (eLim0) { /* 问不到就不拦 */ }
+      var jbTier = jbAsk;
+      if (jbAsk !== 'off' && jbLimMB > 0 && jbLimMB < 700) {
+        jbTier = 'off';
+        g.__memTight = true;   // 主机判定提前置位，int.ts 的紧档逻辑与之一致
+        sdLog('[jit] ⚠ 本次是偏紧档（limit=' + jbLimMB.toFixed(0) + 'MB）：**强制关闭 JIT**' +
+          '（实机崩溃都出现在"偏紧档+JIT"组合，先收敛风险；想开请退出重开直到 ★档位=正常）');
+      }
+      g.__jitTier = jbTier;
+      g.__jitAsked = jbAsk;
+      sdLog('[jit] 档位=' + jbTier + (jbBytes
+        ? '（SD 有 jit-big，内容="' + jbTxt + '"' + (jbAsk !== jbTier ? '，本档被强制关掉' : '') + '）'
+        : '（默认 VM 全解释；要开请写 sdmc:/switch/j2me-nx/jit-big，内容写 hot / big / all；写 off 或删掉=关闭）'));
+      if (jbBytes && jbAsk === 'off') {
+        sdLog('[jit] 注：jit-big 内容认不出档位名（"' + jbTxt + '"）→ 按 off 处理（可用内容：hot / big / bigosr / all / off）');
+      }
+    } catch (eJB) { g.__jitTier = 'off'; }
+    // PATCH(perfZ35)：给 VM 侧留一个"编译现场探针"——[jit-pre]/[jit-post] 会带上这几个数字。
+    // 目的：下次静默退出时，日志能直接回答"编译当时 V8 堆/原生内存是多少"。
+    try {
+      g.__jitMemProbe = function () {
+        try {
+          var m = g.Switch.memoryUsage();
+          var u = (m.usedHeapSize / 1048576).toFixed(1);
+          var t = (m.totalHeapSize / 1048576).toFixed(1);
+          var mAlloc = (typeof m.mallocedMemory === 'number') ? (m.mallocedMemory / 1048576).toFixed(1) : '?';
+          var mPeak = (typeof m.peakMallocedMemory === 'number') ? (m.peakMallocedMemory / 1048576).toFixed(1) : '?';
+          return 'v8=' + u + '/' + t + 'MB malloc=' + mAlloc + ' peak=' + mPeak + 'MB' + nativeMemText();
+        } catch (eJP) { return ''; }
+      };
+    } catch (eJPSet) { /* 探针装不上不影响启动 */ }
     // 字体先于所有脚本就位（gfx.js 建第一个 Font 时就要能用）
     var p = installCjkFont();
     p = p.then(function () { probeCjkGlyphs(); installTextMeasurer(); installTextSpy(); });
@@ -2170,6 +2389,21 @@
         ctx.putImageData(idata, a | 0, b | 0);
         return;
       }
+      // PATCH(perfZ38)：**兜底闸门** —— 我们自己 Image shim 产出的对象若没有任何解码产物
+      // （既无原生 _bitmap 也无 _decoded），交给 Skia 只会抛 "Image or Canvas expected"。
+      // 那个异常会穿过 drawImage → Graphics.drawString/drawImage 的 native 冒进游戏线程里，
+      // 把整局游戏带走（轩辕剑-天之痕就是这样"永远不出首帧"的）。
+      // 这里改成**跳过这一笔绘制**并记一次日志：画面缺点东西，但游戏活着。
+      if (img && img.__j2meImageShim && !img._bitmap && !img._decoded) {
+        g.__imgSkipCount = (g.__imgSkipCount | 0) + 1;
+        if (g.__imgSkipCount === 1) {
+          try {
+            sdLog('[img] 跳过一笔"无解码产物的 Image"绘制（后续同类静默计数）: ' +
+              'w=' + (img.width | 0) + ' h=' + (img.height | 0));
+          } catch (eSk) { /* 忽略 */ }
+        }
+        return;
+      }
       if (arguments.length === 3) return rawDrawImage(img, a, b);
       if (arguments.length === 5) return rawDrawImage(img, a, b, c, d);
       return rawDrawImage(img, a, b, c, d, e, f, gg, hh);
@@ -2238,6 +2472,27 @@
     // 所以呈现到底花多少毫秒只能自己记。清屏/游戏/遮罩/上屏四段分开累计，
     // 每 300 帧随 [present] 一起落盘 —— 由此判断呈现层是不是卡顿元凶。
     var scene = null, sceneCtx = null, sceneW = 0, sceneH = 0;
+    // perfZ27：静态背景（黑底 + 内置遮罩）的烘焙键。键变了（布局/遮罩/画布尺寸）
+    // 或换了 screen 对象/新开一局时才重烘，否则每帧只处理游戏矩形。
+    var sceneBgKey = '';
+    // perfZ31：脏帧跳过。vendor 侧每个 lcdui native 都会给 g.__drawTick 加一
+    // （见 vendor/pluotsorbet/midp/gfx.js 末尾的包装）；游戏这一帧没调用任何绘制
+    // native ⇒ 画面与上次合成的一模一样 ⇒ 直接不做那 ~13ms 的放大 + ~5ms 上屏。
+    // 安全兜底：每 12 帧强制合成一次（万一有漏包的绘制路径，最多 200ms 延迟，
+    // 而且只在"游戏确实没画东西"的帧上才可能发生）。
+    var lastDrawTick = -1, skipAcc = 0, forceCompositeIn = 0;
+    var lastLayoutSig = '';
+    // PATCH(perfZ39)：**按帧边界合成**（治"移动镜头时人物重影/黑屏闪屏"）。
+    // 画面通路：游戏 → offscreen（LCDUI 后备缓冲） --refresh0(每个脏矩形一次, 每次等一个 rAF)--> 设备画布 → 本函数 → scene → screen。
+    // 旧逻辑是"这一帧只要游戏碰过任何 lcdui native（__drawTick 变了）就合成"——
+    // 而 __drawTick 记的是**画进 offscreen 的动作**，与"设备画布何时被刷新"并不同步：
+    //   · 一帧被拆成多个脏矩形时，设备画布在两次 refresh0 之间是半新半旧的混合，
+    //     这时合成就会把"新背景 + 旧位置的角色"画到屏幕上 = 重影；
+    //   · 清屏与绘制分开时，中间那次合成就是"黑屏一闪"（玩家早先报的宠物王国闪屏）。
+    // 新规则：**等到"有刷新落地 且 游戏这一拍没再画"再合成**（= 帧已完整落地），
+    // 长时间不满足再兜底（避免游戏一直画导致永不上屏）。
+    var lastRefreshSeq = 0, lastCheckTick = -1, pendingComposite = false, pendingSince = 0;
+    var compWhenRefresh = 0, compWhenFallback = 0;
     var presAcc = 0, presMax = 0, presMiss = 0;
     var clearMsAcc = 0, gameMsAcc = 0, blitMsAcc = 0;
     function present() {
@@ -2255,9 +2510,10 @@
       // ≤6ms（≈360ms/s 编译能力），LIFO 最新热方法优先。比赛场景新热方法
       // 几秒内编完，而不是排队期间一直被解释（1550budget 实机 vm 仍 90% 的根因）。
       if (typeof g.J2ME !== 'undefined' && g.J2ME && typeof g.J2ME.drainCompileQueue === 'function') {
-        try { g.J2ME.drainCompileQueue(6); } catch (eDQ) { /* 不影响呈现 */ }
+        try { g.__jitPending = g.J2ME.drainCompileQueue(6); } catch (eDQ) { /* 不影响呈现 */ }
       }
       if (__frames === 1) {
+        sceneBgKey = '';   // perfZ27：新的一局 → 背景重烘（遮罩/布局可能与上一局不同）
         // 首帧探针：放行后游戏真正绘出第一画面的时点（逐条立即落盘）
         sdLog('[game] 首帧已绘（呈现层收到第一幅游戏画面）');
         // PATCH(perfZ25)：入口账本收口 —— 选中→读入→入库→isolate→首帧 每段毫秒
@@ -2281,13 +2537,14 @@
                 }
               } catch (eJH) { /* 忽略 */ }
               var ys = g.__yieldStats || null;
+              nativeMemGuard();   // perfZ36：原生余量低就报警/回收（详见 nativeMemGuard）
               sdLog('[crumb] 帧=' + __frames +
                 ' used=' + (m.usedHeapSize / 1048576).toFixed(1) +
                 ' total=' + (m.totalHeapSize / 1048576).toFixed(1) +
                 ' avail=' + (m.totalAvailableSize / 1048576).toFixed(1) +
                 ' malloc=' + (m.mallocedMemory / 1048576).toFixed(1) +
                 ' peakMalloc=' + (m.peakMallocedMemory / 1048576).toFixed(1) +
-                ' java堆=' + jh +
+                ' java堆=' + jh + nativeMemText() +
                 (ys ? ' yield5s=' + ys.total + ' 热停泊=' + ys.parked : ''));
               if (typeof __logFlush === 'function') __logFlush();
             } catch (eCrumb) {
@@ -2301,7 +2558,7 @@
       }
       // 每帧动态取当前 screen 与设备画布（软重启后是新对象）
       var scr = g.screen;
-      if (scr !== lastScr) { lastScr = scr; liveCtx = scr.getContext('2d'); }
+      if (scr !== lastScr) { lastScr = scr; liveCtx = scr.getContext('2d'); sceneBgKey = ''; /* perfZ27：换 screen 对象（软重启）→ 背景重烘 */ }
       var sctx = liveCtx;
       var displayCanvas = null;
       try { displayCanvas = g.document.getElementById('canvas'); } catch (eC) { /* 未就绪 */ }
@@ -2330,7 +2587,8 @@
         var audMs = g.__audMsAcc || 0; g.__audMsAcc = 0;
         var otherMs = Math.max(0, winMs - vmMs - gfxMs - audMs);
         var nWin = Math.max(1, Math.min(__frames - 1, 300)); // 首帧那次窗口不到 300 帧
-        var pAvg = presAcc / nWin;
+        var pAvg = presAcc / (nWin - skipAcc);   // 平均只按"真的合成过的帧"算
+        var skAvg = (skipAcc / nWin * 100).toFixed(0) + '%';
         sdLog('[present] 帧 ' + __frames + ' 画布=' + dw + 'x' + dh +
           (dw > dh ? ' 横屏铺满' : ' 竖屏遮罩') +
           ' | 窗口' + (winMs / 1000).toFixed(1) + 's: vm=' + (vmMs / 1000).toFixed(1) +
@@ -2338,11 +2596,19 @@
           's aud=' + (audMs / 1000).toFixed(1) +
           's other=' + (otherMs / 1000).toFixed(1) + 's' +
           ' | 呈现=' + pAvg.toFixed(1) + 'ms/帧(峰' + presMax + 'ms >20ms帧=' + presMiss +
-          ') 清=' + (clearMsAcc / nWin).toFixed(1) + ' 游戏=' + (gameMsAcc / nWin).toFixed(1) +
-          ' 上屏=' + (blitMsAcc / nWin).toFixed(1) +
+          ') 清=' + (clearMsAcc / Math.max(1, nWin - skipAcc)).toFixed(1) +
+          ' 游戏=' + (gameMsAcc / Math.max(1, nWin - skipAcc)).toFixed(1) +
+          ' 上屏=' + (blitMsAcc / Math.max(1, nWin - skipAcc)).toFixed(1) +
+          ' | 跳帧=' + skAvg + '（无变化帧不合成） drawTick=' + (g.__drawTick | 0) +
+          ' | 上屏刷新=' + (g.__refreshSeq | 0) + '(整屏=' + (g.__refreshFull | 0) +
+          ' 局部=' + (g.__refreshPart | 0) + ' 镜像=' + (g.__mirrorFull | 0) +
+          ' 自拷贝blit=' + (g.__selfBlitN | 0) + ' copyArea=' + (g.__copyAreaN | 0) +
+          ' 边界合成=' + compWhenRefresh +
+          ' 兜底合成=' + compWhenFallback + ')' +
           ' | 真空闲=' + ((winMs - vmMs - gfxMs - audMs - presAcc) / 1000).toFixed(1) + 's ' +
           costAllText());
-        presAcc = 0; presMax = 0; presMiss = 0;
+        presAcc = 0; presMax = 0; presMiss = 0; skipAcc = 0;
+        compWhenRefresh = 0; compWhenFallback = 0;
         clearMsAcc = 0; gameMsAcc = 0; blitMsAcc = 0;
       }
       if (dw > 0 && dh > 0 && sw > 0 && sh > 0) {
@@ -2388,6 +2654,48 @@
           cx = GX + (GW - cw) / 2; cy = GY + (GH - ch) / 2;
         }
         var tClear = Date.now();
+        // PATCH(perfZ31)：**脏帧跳过**；PATCH(perfZ39)：改成**帧边界驱动**（见上面 lastRefreshSeq 注释）。
+        var drawTickNow = g.__drawTick | 0;
+        var refreshNow = g.__refreshSeq | 0;
+        var nowMs = Date.now();
+        var layoutSig = sw + 'x' + sh + '|' + (useMask ? 'M' : '-') + '|' + maskSelId + '|' +
+          (cw | 0) + ',' + (ch | 0) + ',' + (cx | 0) + ',' + (cy | 0);
+        if (refreshNow !== lastRefreshSeq) {
+          // 有新的上屏刷新落地：记下"待合成"，等游戏这一拍停手（或超时）再合成
+          lastRefreshSeq = refreshNow;
+          pendingComposite = true;
+          pendingSince = nowMs;
+        }
+        var gameIdleThisTick = (drawTickNow === lastCheckTick);
+        lastCheckTick = drawTickNow;
+        var needComposite = (layoutSig !== lastLayoutSig) || forceCompositeIn <= 0 || !sceneCtx ||
+          (refreshNow === 0 && drawTickNow !== lastDrawTick);   // 从不刷新的游戏：沿用旧脏帧规则
+        // PATCH(perfZ43)：**兜底窗口 120ms → 16ms（≈一帧）**。
+        // 事故：perfZ39 把"等帧落地"的兜底写成 120ms，而像笑傲武林这种**每帧都在画**的游戏
+        // 永远等不到"这一拍停手"，于是被兜底限流成 ~8 次/秒 → 玩家实测"极为卡顿，没法测"。
+        // 现在：愿意等就等一拍（最多 ~16ms，换来"只在帧完整落地后合成"的好处）；
+        // 游戏一直在画就按正常帧率刷新（每拍都合成），不再人为限流。
+        // 逃生开关：sdmc:/switch/j2me-nx/no-frame-gate → 完全退回旧的"一有绘制就合成"。
+        if (pendingComposite && !g.__noFrameGate &&
+            (gameIdleThisTick || nowMs - pendingSince >= 16)) {
+          // 帧已完整落地（或等了一帧）→ 合成
+          needComposite = true;
+          pendingComposite = false;
+          if (gameIdleThisTick) compWhenRefresh++; else compWhenFallback++;
+        } else if (pendingComposite && g.__noFrameGate && drawTickNow !== lastDrawTick) {
+          needComposite = true;
+          pendingComposite = false;
+          compWhenFallback++;
+        }
+        if (!needComposite) {
+          skipAcc++;
+          forceCompositeIn--;
+          g.__noGen.requestAnimationFrame(present);
+          return;
+        }
+        lastDrawTick = drawTickNow;
+        lastLayoutSig = layoutSig;
+        forceCompositeIn = 12;   // 兜底：即使一直"没变化"也每 12 帧合成一次
         // PATCH(perfZ25)：合成缓冲 + 一次上屏。
         // 旧写法是往可见的 screen 画布上依次 fillRect/game/mask —— 每次调用都是
         // 一次可见表面写入，实机上表现为偶发半帧（清屏后的黑屏一闪、或遮罩还没
@@ -2398,6 +2706,7 @@
             scene = new g.OffscreenCanvas(sw, sh);
             sceneCtx = scene.getContext('2d');
             sceneW = sw; sceneH = sh;
+            sceneBgKey = '';        // 新缓冲：背景必须重烘
             sdLog('[present] 合成缓冲 ' + sw + 'x' + sh + '（单次上屏，防半帧闪屏）');
           } catch (eScene) {
             scene = null; sceneCtx = null;
@@ -2407,16 +2716,41 @@
         var octx = sceneCtx || sctx; // 无离屏时退化为旧行为
         try {
         octx.imageSmoothingEnabled = false; // 像素风硬边放大（防文字发糊）
-        octx.fillStyle = '#000';
-        octx.fillRect(0, 0, sw, sh);
+        // PATCH(perfZ27)：**静态背景烘焙**。实机 [present] 实测呈现 = 18.9ms/帧
+        // （清=0.7 游戏=13.0 上屏=5.2，窗口 300 帧里 19 帧掉到 20ms 以上）—— 而每帧
+        // 都在重画那张 1280x720 的遮罩（1:1 全屏拷贝 ≈5ms），纯属浪费：遮罩是静态的。
+        // 现在把「黑底 + 遮罩」烘进 scene 一次（布局/遮罩变化才重烘），每帧只处理
+        // 游戏矩形（清底色 + 画游戏），上屏仍然是唯一的整屏写入（原子性不变）。
+        // 等价性（可证，不是估）：tools 实测 data/mask.raw —— 透明窗口 [373,0,539x720]
+        // 内 alpha==0 像素 388080/388080（全透明），窗口外全部不透明。游戏恒画在窗口内，
+        // 所以"遮罩垫底 + 游戏在上"与旧的"游戏在下 + 遮罩盖在上"逐像素一致。
+        if (!useMask) {
+          var bgKey = sw + 'x' + sh + '|' + (maskCanvas && dw <= dh ? 'builtin' : 'none');
+          if (sceneCtx && sceneBgKey !== bgKey) {
+            octx.fillStyle = '#000';
+            octx.fillRect(0, 0, sw, sh);
+            if (maskCanvas && dw <= dh) octx.drawImage(maskCanvas, 0, 0, sw, sh);
+            sceneBgKey = bgKey;
+          }
+        }
         var tGame0 = Date.now();
         clearMsAcc += tGame0 - tClear;
         if (useMask) {
-          // 自选遮罩：垫底铺满，游戏画在上面（装饰贴边、游戏居中盖住窗口区）
+          // 自选遮罩：保持原顺序（清屏 → 遮罩 → 游戏）。用户遮罩的透明窗口不一定
+          // 包住游戏矩形，烘背景会改变"游戏盖住装饰"的语义，所以这条路径不优化。
+          octx.fillStyle = '#000';
+          octx.fillRect(0, 0, sw, sh);
           octx.drawImage(useMask, 0, 0, sw, sh);
           octx.drawImage(displayCanvas, cx, cy, cw, ch);
+        } else if (sceneCtx) {
+          // 默认/横屏：背景已烘好 → 每帧只清游戏矩形再画游戏（旧版是全屏清+全屏遮罩）
+          octx.fillStyle = '#000';
+          octx.fillRect(cx, cy, cw, ch);
+          octx.drawImage(displayCanvas, cx, cy, cw, ch);
         } else {
-          // 默认：竖屏游戏画进内置遮罩白区后遮罩盖在上（旧行为）；横屏纯铺满
+          // 无离屏（退化）：旧行为
+          octx.fillStyle = '#000';
+          octx.fillRect(0, 0, sw, sh);
           octx.drawImage(displayCanvas, cx, cy, cw, ch);
           if (maskCanvas && dw <= dh) octx.drawImage(maskCanvas, 0, 0, sw, sh);
         }
@@ -2472,14 +2806,47 @@
     if (s.length > 64) s = s.slice(0, 64);
     return s || 'game';
   }
-  // 同步读文件（存在性探测/迁移用）。返回 Uint8Array 或 null。
+  // 同步读文件（存在性探测/迁移用）。**契约：返回 Uint8Array 或 null**。
+  //
+  // PATCH(perfZ26)：这条契约以前是**假的**，代价是三个功能在实机上全部失效 ——
+  //   nx.js 的 `Switch.readFileSync` 返回的是 **ArrayBuffer**（见运行时 source/fs.cc
+  //   的 `ArrayBuffer::New`），而 Node 的 `fs.readFileSync` 返回 **Buffer**（Buffer
+  //   是 Uint8Array 子类，有 `.length`）。于是调用方那句 `if (bytes && bytes.length)`
+  //   在仿真里恒真、在实机上恒假（`ArrayBuffer.prototype.length` 是 undefined）：
+  //     · `lang.json`  → 语言永远读不回来（玩家报的"选了英文，下次还是中文"，
+  //                       而且日志还会撒谎说"两个候选路径都没有文件"）；
+  //     · `keys.txt`   → 自定义按键映射永远被当成"文件不存在"而重置成默认表；
+  //     · `keyprofiles.json` → 每个游戏的按键机型永远不生效（同样退回默认）。
+  //   这三条在 Node 仿真里永远测不出来（Buffer 有 .length）——所以必须在这里
+  //   统一规整，而不是让每个调用方各自 `instanceof` 判断。
   function readFileSyncLocal(path) {
+    // 正常走 host/bytes.js 的 g.__toU8（SCRIPTS 第一项）。这里的兜底只防"脚本顺序被
+    // 改动/漏拷"这一类事故：宁可多五行重复代码，也不要退回"实机静默读不到文件"。
+    var toU8 = (typeof g.__toU8 === 'function') ? g.__toU8 : function (x) {
+      if (!x) return null;
+      if (x instanceof Uint8Array) return x;
+      if (typeof ArrayBuffer !== 'undefined' && x instanceof ArrayBuffer) return new Uint8Array(x);
+      return x.buffer ? new Uint8Array(x.buffer, x.byteOffset || 0, x.byteLength || 0) : null;
+    };
     if (IS_SWITCH) {
       if (!g.Switch || !g.Switch.readFileSync) return null;
-      try { return g.Switch.readFileSync(path); } catch (e) { return null; }
+      try { return toU8(g.Switch.readFileSync(path)); } catch (e) { return null; }
     }
-    try { return require('fs').readFileSync(path); } catch (e) { return null; }
+    try {
+      var b = require('fs').readFileSync(path);
+      // 仿真保真（perfZ26）：实机返回 ArrayBuffer，Node 返回 Buffer（Buffer 有 .length）。
+      // 正是这个差异让"忘记规整类型"的 bug 在仿真里永远绿、在实机上三个功能全废。
+      // 置 J2ME_TEST_ARRAYBUFFER=1 时把 Buffer 换成等价的 ArrayBuffer，让端到端测试
+      // 跑在"像实机一样"的输入上。实机读不到 process.env，永远走上面的分支。
+      if (typeof process !== 'undefined' && process.env &&
+          process.env.J2ME_TEST_ARRAYBUFFER && b && b.buffer) {
+        b = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+      }
+      return toU8(b);
+    } catch (e) { return null; }
   }
+  // 供 tests/readfile-contract.test.mjs 断言"返回值一定是 Uint8Array 或 null"
+  g.__readFileSyncLocal = readFileSyncLocal;
   function installIDBPersistence() {
     var idb = g.indexedDB;
     if (!idb || !idb.__setPersistence) return false;
@@ -2557,6 +2924,60 @@
     }
 
     var saveTimer = null;
+    // PATCH(perfZ44)：**存档原子落盘**。
+    // 由来（外部评审指出，确实成立）：原来是直接 `writeFileSync(saveFile, bytes)` 覆盖目标文件，
+    // 一旦在写入过程中断电/SD 异常/进程被杀，idb-fs.json 就可能变成半截 JSON；
+    // 下一次读取解析失败后只能退成空库 —— 这种损失只有在玩家玩了几十小时之后才被发现。
+    // 现在按"临时文件 → 备份旧档 → 原子改名"三步走：
+    //   idb-fs.json.tmp  ← 先整份写进临时文件（此时旧档仍完好）
+    //   idb-fs.json      → idb-fs.json.bak（旧档留一份，仅当旧档存在）
+    //   idb-fs.json.tmp  → idb-fs.json（改名是原子的，读者要么看到旧的、要么看到新的）
+    // 读取侧（load）在解析主档失败时会自动回落到 .bak。
+    function atomicWrite(path, bytes) {
+      var tmp = path + '.tmp';
+      var bak = path + '.bak';
+      var fsMod = IS_SWITCH ? null : require('fs');
+      var writeRaw = function (p, b) {
+        if (IS_SWITCH) { g.Switch.writeFileSync(p, b); return; }
+        fsMod.writeFileSync(p, Buffer.from(b));
+      };
+      var exists = function (p) {
+        try {
+          if (IS_SWITCH) { return !!(g.Switch.statSync && g.Switch.statSync(p)); }
+          return fsMod.existsSync(p);
+        } catch (e) { return false; }
+      };
+      var removeIfAny = function (p) {
+        try {
+          if (IS_SWITCH) { if (g.Switch.removeSync) g.Switch.removeSync(p); return; }
+          if (fsMod.existsSync(p)) fsMod.unlinkSync(p);
+        } catch (e) { /* 删不掉不影响主流程 */ }
+      };
+      var rename = function (from, to) {
+        if (IS_SWITCH) {
+          if (!g.Switch.renameSync) throw new Error('Switch.renameSync 不存在');
+          g.Switch.renameSync(from, to);
+          return;
+        }
+        fsMod.renameSync(from, to);
+      };
+      // 1) 整份写进 .tmp
+      writeRaw(tmp, bytes);
+      // 2) 旧档转成 .bak（先删掉更老的 .bak）
+      if (exists(path)) {
+        removeIfAny(bak);
+        try { rename(path, bak); }
+        catch (eBak) { removeIfAny(path); }   // 改名失败就退化成"覆盖写"，至少不留半截
+      }
+      // 3) .tmp 原子改名成正式档
+      try {
+        rename(tmp, path);
+      } catch (eRename) {
+        // 该平台不支持改名（或跨设备）：退化成直接写正式档，并留下 .tmp 供人工恢复
+        writeRaw(path, bytes);
+      }
+    }
+
     function writeNow(db) {
       if (!saveFile) { console.error('[host] 存档写入跳过：尚未选择游戏'); return; }
       try {
@@ -2568,11 +2989,9 @@
             console.error('[host] Switch.writeFileSync 不存在，存档未落盘');
             return;
           }
-          g.Switch.writeFileSync(saveFile, bytes);
-        } else {
-          require('fs').writeFileSync(saveFile, Buffer.from(bytes));
         }
-        console.log('[host] 存档已写入 ' + saveFile + '（' + bytes.length + ' 字节）');
+        atomicWrite(saveFile, bytes);
+        console.log('[host] 存档已写入 ' + saveFile + '（' + bytes.length + ' 字节，原子替换 + .bak 备份）');
       } catch (e) {
         console.error('[host] 存档写入失败: ' + (e && e.stack || e));
       }
@@ -2606,7 +3025,20 @@
           }
           return readFileBytes(saveFile);
         }).then(function (bytes) {
-          var data = JSON.parse(new TextDecoder().decode(bytes));
+          // PATCH(perfZ44)：主档解析失败时回落到 .bak（原子替换留下的上一份完好存档）。
+          var data;
+          try {
+            data = JSON.parse(new TextDecoder().decode(bytes));
+          } catch (eMain) {
+            var bakBytes = null;
+            try { bakBytes = readFileBytes(saveFile + '.bak'); } catch (eB) { bakBytes = null; }
+            if (bakBytes && bakBytes.length) {
+              data = JSON.parse(new TextDecoder().decode(bakBytes));
+              sdLog('[save] 主存档损坏，已回落到 .bak 备份（' + bakBytes.length + ' 字节）');
+            } else {
+              throw eMain;
+            }
+          }
           // 还原 Blob
           for (var sn in data) {
             var obj = data[sn];
@@ -3013,6 +3445,35 @@
           ctx.fillStyle = '#6f9f6f';
           ctx.font = '22px "j2mecjk", monospace';
           ctx.fillText(T('游戏内: A=确认 B=5 X=1 Y=3 L=* R=# ZL/ZR=软键 L3=7 R3=9 -=0 +=退出'), 80, H - 22);
+          // 界面上**不**画版本/内存档位（2026-09-24 用户明确要求"不许打在屏幕上"）。
+          // 认版本改用两条不打扰玩家的途径：
+          //   ① 产物文件名带版本戳：dist/J2me-nx-<构建标记>.nro / .nsp；
+          //   ② 日志：`[boot] 入口加载 … build=…` 与 `[boot] 形态=… ｜ 内存 limit=…`。
+          // 需要临时在屏幕上核对时，把下面这个开关改成 true 即可（默认关，别带回发布版）。
+          var SHOW_BUILD_TAG = false;
+          if (SHOW_BUILD_TAG) {
+            try {
+              var limNow = (typeof g.__memLimitMB === 'number') ? g.__memLimitMB : 0;
+              var tightNow = g.__memTight === true;
+              ctx.fillStyle = tightNow ? '#a8794d' : '#4d7d4d';
+              // 纯 ASCII：调试文本不进界面字典，也就不该混进"上屏汉字必须 T()"的守卫
+              drawTextRight('build ' + BUILD_TAG + ' | mem ' + (limNow ? limNow + 'MB' : '?'), W - 40, H - 22, 18);
+            } catch (eBT) { /* 标记画不出来不影响菜单 */ }
+          }
+          // PATCH(perfZ27)：把这次真正上屏的列表文字（含改名标记/分辨率标记）交给
+          // 宿主做豆腐块审计 —— 缺字形的字符会以码位落进 [font-audit]，不用再靠玩家猜。
+          try {
+            if (typeof g.__j2meFontAudit === 'function') {
+              var auditRows = [];
+              for (var ar = 0; ar < maxRows && ar + scroll < entries.length; ar++) {
+                var ae = entries[ar + scroll];
+                auditRows.push((ae.name || '') + (ae.orgName ? '  ' + RENAME_MARK : '') +
+                  (overrides[ae.file] ? '  [' + overrides[ae.file] + ']' : ''));
+              }
+              g.__j2meFontAudit(auditRows, '30px "j2mecjk", monospace');
+              if (typeof g.__j2meFontAuditStep === 'function') g.__j2meFontAuditStep();
+            }
+          } catch (eAudit) { /* 审计故障不影响菜单 */ }
           for (var r = 0; r < maxRows && r + scroll < entries.length; r++) {
             var idx = r + scroll, en = entries[idx];
             var y = top + r * rowH;
@@ -3024,7 +3485,10 @@
             ctx.font = '30px "j2mecjk", monospace';
             ctx.fillText((idx === sel ? '▶ ' : '  ') + en.name +
               (en.midletClass ? '' : T('（无入口）')) +
-              (en.orgName ? '  ✎' : '') +
+              // PATCH(perfZ27)：改名标记 = 字体里**确有字形**的常见符号（见 RENAME_MARK）。
+              // 旧标记用铅笔符号 U+270E，而 U+270D~U+2712 这组字形两款内置字体都没有
+              // → 一直渲染成 .notdef 方块（玩家看到的"名字后面像两个口口"就是它）。
+              (en.orgName ? '  ' + RENAME_MARK : '') +
               (overrides[en.file] ? '  [' + overrides[en.file] + ']' : ''), 84, y);
             ctx.fillStyle = '#6c6c6c';
             ctx.font = '19px "j2mecjk", monospace';
@@ -4255,10 +4719,12 @@
               'MB avail=' + (m.totalAvailableSize / 1048576).toFixed(1) +
               'MB limit=' + (m.heapSizeLimit / 1048576).toFixed(1) +
               'MB malloc=' + (m.mallocedMemory / 1048576).toFixed(1) +
-              'MB peakMalloc=' + (m.peakMallocedMemory / 1048576).toFixed(1) + 'MB' + jh;
+              'MB peakMalloc=' + (m.peakMallocedMemory / 1048576).toFixed(1) + 'MB' + jh +
+              nativeMemText();   // perfZ36：原生堆/代码段（紧档下先耗尽的往往是这本账）
           } catch (e) { return '[mem] ' + tag + ' 读取失败: ' + (e && e.message); }
         };
         sdLog(memLine('启动时'));
+        nativeMemGuard();   // perfZ37：菜单/开机阶段也要盯原生余量（原来只在 1s 面包屑里）
         // 抄录 runtime 自身日志（sdmc:/switch/nxjs-debug.log，上次运行退出时写盘，
         // 所以开机读到的是"上一次运行"的内容）。jitfix runtime 会在里面记录
         // [v8] mem_total/free/regime 与 heap_limit 夹取明细
@@ -4387,6 +4853,70 @@
           }
           var noThr = readFileSyncLocal('sdmc:/switch/j2me-nx/no-throttle') !== null;
           g.__noYieldThrottle = noThr;
+          // PATCH(perfZ40)：镜像拷贝逃生开关。默认"整块镜像"（治拖影/残影，见 gfx.js refresh0 说明）；
+          // 放 sdmc:/switch/j2me-nx/partial-blit 可退回旧的"只拷脏矩形"行为，同一次开机即可 A/B。
+          var partialBlit = readFileSyncLocal('sdmc:/switch/j2me-nx/partial-blit') !== null;
+          g.__partialBlit = partialBlit;
+          // PATCH(perfZ43)：帧边界合成门的逃生开关。默认开（等一拍再合成）；
+          // 放 sdmc:/switch/j2me-nx/no-frame-gate 则完全退回"一有绘制就合成"（perfZ38 行为）。
+          var noGate = readFileSyncLocal('sdmc:/switch/j2me-nx/no-frame-gate') !== null;
+          g.__noFrameGate = noGate;
+          // PATCH(perfZ47)：宠物王国4-白金"整屏周期性变黑约 1 秒"的两个开关（默认都关）。
+          //
+          // 症状：玩家实测该游戏画面会"黑 1 秒 → 恢复正常游戏画面 → 一直循环"，而同一个 jar
+          // 在 KEmulator 上不黑 ⇒ 是我们的 bug。日志侧已排除：合成缓冲正常、无画布漂移、
+          // 无绘制异常、每次 refresh 都对应一次合成（边界合成=刷新数，兜底合成=0）。
+          // 也就是说"黑"只可能来自：**镜像到设备画布的那一块 LCDUI 缓冲在上屏那一刻就是黑的**。
+          // 而"为什么它会是黑的"有两种可能，必须用数据分开：
+          //   ① 游戏自己画了黑帧（那就是游戏状态机问题，要往 API 差异方向查）；
+          //   ② 我们的整块镜像是**延后到 rAF** 做的（见 gfx.js refresh0），若那次 refresh0
+          //      没能把绘制线程真正挂起，游戏就会在"请求上屏"之后继续往同一块缓冲上画
+          //      （先清成黑、再画内容）⇒ 我们抓到的正是"清完还没画"的半帧。
+          //
+          //   probe-mirror → 采样探针：每次（节流到约 2 次/秒）在 refresh 当场对缓冲取 3 个点，
+          //                  再在镜像 rAF 里取一次；两者不一致即证明②（缓冲区被改写）；
+          //                  一致且为透明/纯黑即证明①（游戏自己画的）。只读 3 个像素，开销可忽略。
+          //   sync-mirror  → 修法候选：整块镜像从"延后到 rAF"改成"refresh0 当场同步拷贝"，
+          //                  让快照严格落在游戏请求上屏的那一刻。
+          var probeMirror = readFileSyncLocal('sdmc:/switch/j2me-nx/probe-mirror') !== null;
+          g.__probeMirror = probeMirror;
+          var syncMirror = readFileSyncLocal('sdmc:/switch/j2me-nx/sync-mirror') !== null;
+          g.__syncMirror = syncMirror;
+          g.__mirrorSync = 0;
+          sdLog('[present] 上屏镜像=' + (partialBlit ? '只拷脏矩形（partial-blit 开关）' : '整块（默认，防拖影）') +
+            (syncMirror ? '＋**当场同步快照**（sync-mirror 开关）' : '＋延后到 rAF 快照') +
+            (probeMirror ? '｜镜像采样探针=开' : '') +
+            ' ｜ 帧边界合成=' + (noGate ? '关（no-frame-gate 开关）' : '开（最多等一拍 16ms）'));
+          // PATCH(perfZ42)：**绘制轨迹探针的开关**（默认关）。
+          // 玩法：玩到"剧情强制平移镜头"之前，在 SD 上建一个空文件
+          //   sdmc:/switch/j2me-nx/trace-draw
+          // 宿主每 5 秒看一次这个文件，看到就把接下来 8 秒的所有绘制调用（REGION/RGB/CLIP）
+          // 逐笔落盘到日志（每 200ms 最多 64 行）。用来判定"游戏自己把画面部分更新上屏"时，
+          // 覆盖范围到底够不够 —— 笑傲武林就是这种写法（见 PERF §49）。
+          // 想再采一段：删掉文件再重建即可（每个文件生命周期只触发一次）。
+          try {
+            var traceWant = readFileSyncLocal('sdmc:/switch/j2me-nx/trace-draw') !== null;
+            if (traceWant && !g.__traceArmed) {
+              g.__traceArmed = true;
+              g.__traceDrawLeft = 8;
+              // perfZ43：探针的"拼字符串"成本必须由 vendor 侧的模块内布尔量把关
+              if (typeof g.__setDrawTrace === 'function') g.__setDrawTrace(true);
+              sdLog('[draw-trace] 已开启：接下来 8 秒逐笔记录绘制（REGION/RGB/CLIP）');
+              if (typeof __logFlush === 'function') __logFlush();
+            } else if (!traceWant && g.__traceArmed) {
+              g.__traceArmed = false;
+            }
+            if (g.__traceArmed) {
+              g.__traceDrawLeft = (g.__traceDrawLeft | 0) - 5;
+              if (g.__traceDrawLeft <= 0) {
+                g.__traceArmed = false;
+                if (typeof g.__setDrawTrace === 'function') g.__setDrawTrace(false);
+                sdLog('[draw-trace] 记录结束（删掉 trace-draw 文件再建一次可再采一段）');
+              }
+            }
+          } catch (eTrace) { /* 忽略 */ }
+          // 2026-09-24 perfZ46：perfZ45 的"帧落盘取证"（dump-frames 开关 / 每 5 秒一次的存在性检查）
+          // 已整体删除——玩家实测性能不足以边跑边取证，改为给截图。详见本文件上方 PATCH 注释。
           sdLog('[yield] 节流=' + (noThr
             ? '关（存在 no-throttle 标记文件，走原版纯 yield）'
             : '开（同一 16ms 内 >256 次 yield → sleep(1) 真停泊）'));
@@ -4408,6 +4938,33 @@
           }
           if (typeof __logFlush === 'function') __logFlush();
         } catch (eCfgLog) { /* 忽略 */ }
+        // PATCH(perfZ30)：**开机形态 + 内存档位**打点。
+        // 起因：玩家装好 slim NSP 后报告"还是偏紧档，帮助不大"，但日志里根本分不出
+        // 哪次开机是 NSP、哪次是 hbmenu 起的 NRO —— 于是没法判断"偏紧"到底怪谁。
+        // 判定方法很干脆：slim NSP 的 romfs 里，nxjs.ini 是**构建器注入过 `[runtime]`**的
+        // （slim 打包时自动写入 `version = ^1.0.0-beta.6`）；独立 NRO 的 ini 没有这一段。
+        // 顺带把 Switch 暴露的 API 名字与原始内存字段打一行，方便判断运行时新旧/regime。
+        try {
+          var iniText = '';
+          try {
+            var iniBytes = readFileSyncLocal('romfs:/nxjs.ini');
+            if (iniBytes) iniText = decodeText(iniBytes);
+          } catch (eIni) { /* 读不到就算了 */ }
+          var rtVer = /\[runtime\][\s\S]{0,200}?version\s*=\s*([^\s;]+)/.exec(iniText);
+          var form = rtVer ? ('NSP-slim（共享运行时 ' + rtVer[1] + '）') : 'NRO-独立';
+          var mm = null;
+          try { mm = g.Switch.memoryUsage(); } catch (eMM2) { /* 忽略 */ }
+          var apiKeys = '';
+          try { apiKeys = Object.keys(g.Switch).join(','); } catch (eAK) { /* 忽略 */ }
+          sdLog('[boot] 形态=' + form + ' ｜ 内存 limit=' +
+            (typeof limMB === 'number' ? limMB.toFixed(0) + 'MB' : '?') +
+            ' heap=' + (mm ? (mm.totalHeapSize / 1048576).toFixed(1) + 'MB' : '?') +
+            ' native=' + (mm && mm.mallocedMemory !== undefined ? (mm.mallocedMemory / 1048576).toFixed(1) + 'MB' : '?') +
+            ' peakNative=' + (mm && mm.peakMallocedMemory !== undefined ? (mm.peakMallocedMemory / 1048576).toFixed(1) + 'MB' : '?') +
+            nativeMemText() +   // perfZ36：开机时的原生堆/arena/代码段底数（与紧档 425MB 对照）
+            ' ｜ Switch API: ' + apiKeys);
+          if (typeof __logFlush === 'function') __logFlush();
+        } catch (eForm) { /* 诊断不干扰启动 */ }
         if (typeof __logFlush === 'function') __logFlush(); // 启动期探针：立即落盘
         // [jheap] 探测本身只读常量（__maxMemory），真正的内存大头是
         // native-heap.js 装载时的 RAB 构造（按 maxByteLength 预留 mman），
@@ -4466,6 +5023,7 @@
             if (typeof __logFlush === 'function') __logFlush();
           }
           sdLog(memLine('运行中#' + (++beatCount)));
+          nativeMemGuard();   // perfZ37：10s 心跳也过一遍（覆盖没有面包屑的菜单/加载阶段）
           // PATCH(perfZ23)：英文界面里"还剩哪些中文"由运行时攒着，这里每 10s 落一次。
           // 实机上英文文案漏翻只有玩家看得到（我们看不到屏），有了这条日志，
           // 玩家只要在英文界面下把各面板翻一遍，日志里就直接列出漏掉的串。
@@ -4514,6 +5072,22 @@
               if (hs) sdLog('[alloc] 卡顿现场: ' + JSON.stringify(hs));
             }
           } catch (ape) { /* 探针倾倒故障不干扰游戏 */ }
+          // PATCH(perfZ32b)：JIT 成本账 —— 编译毫秒 vs 帧率收益，是"值不值"的唯一判据。
+          // PATCH(perfZ35)：补上"本会话上限"与"实际/请求档位"，方便一眼判断上限有没有生效。
+          try {
+            if (g.__jitTier && g.__jitTier !== 'off') {
+              sdLog('[jit] 档位=' + g.__jitTier +
+                ' 已编译=' + (g.__jitCompileN | 0) +
+                ' 编译累计=' + ((g.__jitCompileMs || 0) | 0) + 'ms' +
+                ' 本窗口=' + (((g.__jitCompileMs || 0) - (g.__jitCompileMsBase || 0)) | 0) + 'ms' +
+                ' 待编译=' + (g.__jitPending | 0) +
+                ' 上限=' + (g.__jitCompileCap | 0) + '个方法');
+              g.__jitCompileMsBase = g.__jitCompileMs || 0;
+            } else if (g.__jitAsked && g.__jitAsked !== 'off') {
+              sdLog('[jit] 本会话 JIT=off（SD 请求=' + g.__jitAsked + '，被偏紧档安全策略关掉了）' +
+                ' 已编译=' + (g.__jitCompileN | 0));
+            }
+          } catch (eJitLog) { /* 忽略 */ }
           // PATCH(perfZ25)：耗时账本 —— 读盘/解压/解码窗口汇总。
           // 与 [present] 的 vm/gfx/aud 互补：那三笔只覆盖 VM 内部，入口卡顿几乎
           // 全发生在这几笔宿主账上（jar 读盘、zip 解压、PNG 解码）。

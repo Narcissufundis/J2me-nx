@@ -138,7 +138,51 @@ var currentlyFocusedTextEditor;
     };
 
     var refreshStr = "refresh";
+    // perfZ40：整块镜像的合并状态（见下面 refresh0 里的大段说明）
+    var pendingMirrorCtxs = [];
+    var mirrorScheduled = false;
+
+    // PATCH(perfZ47)：**镜像快照采样探针**（默认关，由宿主按 SD 文件 g.__probeMirror 打开）。
+    // 由来：宠物王国4-白金实测"整屏周期性变黑约 1 秒"，而同一 jar 在 KEmulator 上正常。
+    // 本文件已知嫌疑：整块镜像是**延后到 rAF** 做的（见下面 refresh0），若那次 refresh0 没能把
+    // 绘制线程真正挂起，游戏就会在"请求上屏"之后继续往同一块缓冲上画（先清黑、再画内容）
+    // ⇒ 我们抓到的正是"清完还没画"的半帧。探针读 3 个点、每 ~0.5s 一次，开销可忽略。
+    var probeSnapshot = null, probeSeq = 0, probeAt = 0;
+    function sampleOffscreenPixels() {
+        try {
+            var w = offscreenCanvas.width, h = offscreenCanvas.height;
+            var xs = [w >> 1, w >> 2, (w * 3) >> 2];
+            var ys = [h >> 1, h >> 2, (h * 3) >> 2];
+            var out = [];
+            for (var i = 0; i < 3; i++) {
+                var d = offscreenContext2D.getImageData(xs[i], ys[i], 1, 1).data;
+                out.push(((d[0] << 16) | (d[1] << 8) | d[2]).toString(16) + (d[3] === 0 ? ':透明' : ''));
+            }
+            return out.join('/');
+        } catch (e) { return 'ERR'; }
+    }
+    function probeFinish(tag) {
+        if (!probeSnapshot) { return; }
+        var before = probeSnapshot;
+        probeSnapshot = null;
+        var gP = (typeof globalThis !== "undefined") ? globalThis : null;
+        if (!gP || !gP.__sdMark) { return; }
+        var after = sampleOffscreenPixels();
+        var dt = Date.now() - probeAt;
+        if (after !== before) {
+            gP.__sdMark('[probe] ⚠ 缓冲在"请求上屏"到"镜像拷贝"之间被改写：refresh#' + probeSeq +
+                ' 刷新时=' + before + ' 镜像时=' + after + ' 间隔=' + dt + 'ms（' + tag + '）');
+        } else {
+            gP.__sdMark('[probe] refresh#' + probeSeq + ' 前后一致=' + before + ' 间隔=' + dt + 'ms（' + tag + '）');
+        }
+    }
     Native["com/sun/midp/lcdui/DisplayDevice.refresh0.(IIIIII)V"] = function(addr, hardwareId, displayId, x1, y1, x2, y2) {
+        // perfZ40：原始参数留档（诊断用）。Java 侧文档写明 x2/y2 是"右下角坐标"，
+        // 即**含端点**；`CustomItemLFImpl` 里也算的是 `x2 - x1 + 1`（见该文件 576 行）。
+        // 上游/我们的老代码算的是 `x2 - x1` ⇒ 每个刷新矩形都**少拷最后一行一列**
+        // （整屏刷新时就是屏幕最右一列/最下一行永远不更新 → 那一条像素永远停在上一次的内容）。
+        var rectX1 = x1, rectY1 = y1, rectX2 = x2, rectY2 = y2;
+
         x1 = Math.max(0, x1);
         y1 = Math.max(0, y1);
         x2 = Math.max(0, x2);
@@ -146,23 +190,115 @@ var currentlyFocusedTextEditor;
 
         var maxX = Math.min(offscreenCanvas.width, MIDP.deviceContext.canvas.width);
         x1 = Math.min(maxX, x1);
-        x2 = Math.min(maxX, x2);
+        x2 = Math.min(maxX - 1, x2);   // 含端点 → 上界是 maxX-1（否则源矩形会越界、被 Skia 缩放变形）
+        x1 = Math.min(x1, x2);
+        if (x1 < 0) x1 = 0;
 
         var maxY = Math.min(offscreenCanvas.height, MIDP.deviceContext.canvas.height);
         y1 = Math.min(maxY, y1);
-        y2 = Math.min(maxY, y2);
+        y2 = Math.min(maxY - 1, y2);
+        y1 = Math.min(y1, y2);
+        if (y1 < 0) y1 = 0;
 
-        var width = x2 - x1;
-        var height = y2 - y1;
+        var width = x2 - x1 + 1;      // 含端点
+        var height = y2 - y1 + 1;
         if (width <= 0 || height <= 0) {
             return;
         }
 
+        // PATCH(j2me-nx-port perfZ39/perfZ40)：**帧边界计数 + 整块镜像**。
+        // 由来：玩家报"移动镜头时人物重影"，并确认是**拖影/残影（旧位置没擦掉）**。
+        // 残影是**持久**的 ⇒ 那些像素根本没被送到设备画布，而不是时序抖动。本移植的画面通路是
+        //   游戏 → offscreenCanvas（LCDUI 后备缓冲） --refresh0(逐脏矩形)--> 设备画布 --> 宿主呈现层
+        // 设备画布不是显示缓冲，而是靠 refresh0 逐块**拼出来的一面镜子**：
+        //   · 漏掉的那块（脏矩形没覆盖、或上面那个"少一行一列"的 off-by-one）会**永远**停在旧内容；
+        //   · 一帧被拆成多个脏矩形时，镜子在两次之间是半新半旧的混合 → 合成出来就是
+        //     "新背景 + 旧位置的角色"（重影）、或"清屏后还没画"（黑屏闪屏）。
+        // 所以：默认把**整块** offscreen 拷到设备画布（镜子永远等于 LCDUI 缓冲，逐块推论全部作废），
+        // 同一 tick 内的多次刷新合并成一次拷贝，被 $.pause 的 Java 线程仍在同一个 rAF 里各自唤醒。
+        // 逃生开关：sdmc:/switch/j2me-nx/partial-blit → 退回旧的"只拷脏矩形"行为，便于 A/B。
+        var g = (typeof globalThis !== "undefined") ? globalThis : null;
+        if (g) {
+            g.__refreshSeq = (g.__refreshSeq | 0) + 1;
+            var isFull = (x1 === 0 && y1 === 0 &&
+                          width >= offscreenCanvas.width && height >= offscreenCanvas.height);
+            if (isFull) g.__refreshFull = (g.__refreshFull | 0) + 1;
+            else g.__refreshPart = (g.__refreshPart | 0) + 1;
+            g.__refreshLastAt = Date.now();
+            // 前 3 次把原始矩形落盘 —— 用来在实机上确认"含端点"的判定是否正确
+            if (g.__refreshSeq <= 3 && g.__sdMark) {
+                g.__sdMark("[refresh] #" + g.__refreshSeq + " 原始 rect=" + rectX1 + "," + rectY1 +
+                    ".." + rectX2 + "," + rectY2 + " → 拷贝 " + width + "x" + height +
+                    " 画布=" + offscreenCanvas.width + "x" + offscreenCanvas.height +
+                    (isFull ? "（整屏）" : "（局部）"));
+            }
+        }
+
         var ctx = $.ctx;
-        window.requestAnimationFrame(function() {
-            MIDP.deviceContext.drawImage(offscreenCanvas, x1, y1, width, height, x1, y1, width, height);
-            J2ME.Scheduler.enqueue(ctx);
-        });
+        // PATCH(j2me-nx-port perfZ40)：**整块镜像拷贝**（治"旧位置没擦掉"的拖影/残影）。
+        //
+        // 实机症状（玩家确认是"拖影/残影：旧位置没擦掉"，不是发虚）：镜头一动，人物的旧位置
+        // 一直留在屏幕上。残影是**持久**的，说明那些像素**根本没被送到设备画布**，而不是时序抖动。
+        //
+        // 根因就在这一行：设备画布不是"显示缓冲"，而是靠 refresh0 逐脏矩形**拼出来的一面镜子**。
+        // 只要有一个矩形没被刷新（phoneME 认为没坏、或游戏的 repaint 矩形没覆盖到那块），
+        // 那部分就一直停在上一次的状态 —— 游戏明明已经把旧位置擦掉了（擦在 offscreen 里），
+        // 屏幕上也永远不会更新。浏览器版看不出来（浏览器直接显示那块 canvas），
+        // 我们却要靠这面镜子，所以必须让镜子**永远等于** LCDUI 缓冲：
+        // 每次 refresh0 改为把**整块** offscreen 拷到设备画布（同一 tick 内的多次刷新合并成一次拷贝，
+        // 每个被 $.pause 的 Java 线程仍在同一个 rAF 里各自唤醒）。
+        // 逃生开关：放 sdmc:/switch/j2me-nx/partial-blit 可退回旧的"只拷脏矩形"行为（方便 A/B）。
+        var g2 = (typeof globalThis !== "undefined") ? globalThis : null;
+        var usePartial = !!(g2 && g2.__partialBlit);
+        // PATCH(perfZ47)：采样探针（默认关）。节流到每 6 次刷新取一轮 ≈ 2 次/秒。
+        if (g2 && g2.__probeMirror && (probeSeq !== g2.__refreshSeq) && ((g2.__refreshSeq | 0) % 6 === 0)) {
+            probeSnapshot = sampleOffscreenPixels();
+            probeSeq = g2.__refreshSeq | 0;
+            probeAt = Date.now();
+        }
+        // PATCH(perfZ47)：**当场同步快照**（默认关，SD 文件 sync-mirror 开启）。
+        // 修法候选：整块镜像原先延后到 rAF 才拷，快照因此可能晚于"游戏请求上屏"的那一刻；
+        // 改成在这里（refresh0 内）立刻拷贝，快照与硬件 flip 的语义就一致了。
+        var useSync = !!(g2 && g2.__syncMirror);
+        if (usePartial) {
+            window.requestAnimationFrame(function() {
+                MIDP.deviceContext.drawImage(offscreenCanvas, x1, y1, width, height, x1, y1, width, height);
+                probeFinish('partial-blit');
+                J2ME.Scheduler.enqueue(ctx);
+            });
+        } else {
+            if (useSync) {
+                try {
+                    MIDP.deviceContext.drawImage(offscreenCanvas, 0, 0);
+                    if (g2) g2.__mirrorSync = (g2.__mirrorSync | 0) + 1;
+                } catch (eSync) {
+                    if (g2 && g2.__sdMark) g2.__sdMark("[mirror] 同步整块镜像失败: " + (eSync && eSync.message));
+                }
+            }
+            pendingMirrorCtxs.push(ctx);
+            if (!mirrorScheduled) {
+                mirrorScheduled = true;
+                window.requestAnimationFrame(function() {
+                    mirrorScheduled = false;
+                    var syncNow = !!(g2 && g2.__syncMirror);
+                    if (!syncNow) {
+                        try {
+                            MIDP.deviceContext.drawImage(offscreenCanvas, 0, 0);
+                            if (g2) g2.__mirrorFull = (g2.__mirrorFull | 0) + 1;
+                        } catch (eMirror) {
+                            if (g2 && g2.__sdMark) g2.__sdMark("[mirror] 整块镜像失败: " + (eMirror && eMirror.message));
+                        }
+                    }
+                    probeFinish(syncNow ? '同步快照' : '延后 rAF');
+                    // 被 pause 的 Java 线程逐个唤醒（一次 rAF 里可能合并了好几次 refresh0）
+                    var cs = pendingMirrorCtxs;
+                    pendingMirrorCtxs = [];
+                    for (var i = 0; i < cs.length; i++) {
+                        J2ME.Scheduler.enqueue(cs[i]);
+                    }
+                });
+            }
+        }
         $.pause(refreshStr);
         $.nativeBailout(J2ME.Kind.Void);
     };
@@ -605,12 +741,64 @@ var currentlyFocusedTextEditor;
         info.reset(0, 0, info.contextInfo.context.canvas.width, info.contextInfo.context.canvas.height);
     };
 
+    // PATCH(j2me-nx-port perfZ48)：**允许在屏幕 Graphics 上 copyArea** + 快照画布复用。
+    //
+    // 事故（宠物王国4-白金，2026-09-24 实机，`build=20260924-perfZ47-mirrorsync`）：
+    // 玩家报"画面变黑约 1 秒 → 恢复正常 → 一直循环"，KEmulator 上同一 jar 正常。
+    // 探针（probe-mirror）证明镜像前后一致、且缓冲区是**不透明白黑**（游戏自己画的），
+    // 再顺着 `[jit-trap] method=e.a.(Ljavax/microedition/lcdui/Graphics;)V pc=771` 反汇编，
+    // 命中这条：
+    //     g.setClip(0, 0, 256, 336);
+    //     g.copyArea(0, 0, 256, 336, dx, dy, 20);     // 20 = TOP|LEFT
+    // 即**该游戏用 copyArea 做整幅地图滚动**（幅面 256x336 比 240x320 画布还大，多出来的部分
+    // 靠 clip 裁掉）。而本文件原本照抄 MIDP 的那条限制"目标是实际显示屏 → IllegalStateException"
+    // 直接 throw ⇒ 每帧一滚动就在"已经清成黑、还没画内容"的位置整帧中断 ⇒ 玩家看到的就是
+    // 整屏黑；不碰滚动的那些帧不调 copyArea ⇒ 画面又正常。黑/正常交替，与玩家描述完全一致。
+    //
+    // 为什么我们这里必须允许：**本移植的"屏幕 Graphics"并不是直接显示表面**，而是 LCDUI
+    // 后备缓冲 —— 见本文件顶部 `screenContextInfo` 建在 `offscreenContext2D` 上，真正上屏
+    // 是 refresh0 整块镜像到设备画布。所以在这块上做自拷贝是安全的，也正是这些老游戏期望的
+    // 语义（双缓冲 Canvas 上的标准滚动写法，KEmulator/真机都允许）。
+    // 另外：快照画布改为**复用**（游戏每帧滚动时，原实现每次 createElement + 240x320 分配）。
+    var copyAreaSnapshot = null, copyAreaSnapshotCtx = null;
     Native["javax/microedition/lcdui/Graphics.copyArea.(IIIIIII)V"] = function(addr, x_src, y_src, width, height, x_dest, y_dest, anchor) {
         var self = getHandle(addr);
-        if (isScreenGraphics(self)) {
-            throw $.newIllegalStateException();
+        // 语义：把当前图形上下文的 (x_src,y_src,width,height) 拷到 (x_dest,y_dest)（按 anchor 对齐），
+        // 受当前 clip 限制，且**允许源与目标重叠**（滚动就是这样用的）。
+        // 实现：先把整块画布快照到临时画布（重叠安全），再按目标矩形画回去 ——
+        // 目标绘制走当前 ctx（clip/translate 已由 getGraphicsContext 应用）。
+        var info = NativeMap.get(addr);
+        var c = info.getGraphicsContext();
+        var canvas = c.canvas;
+        var tmp = copyAreaSnapshot;
+        if (!tmp || tmp.width !== canvas.width || tmp.height !== canvas.height) {
+            tmp = copyAreaSnapshot = document.createElement("canvas");
+            tmp.width = canvas.width;
+            tmp.height = canvas.height;
+            copyAreaSnapshotCtx = tmp.getContext("2d");
         }
-        console.warn("javax/microedition/lcdui/Graphics.copyArea.(IIIIIII)V not implemented");
+        // 尺寸一致 ⇒ 这次 drawImage 会覆盖整块快照，不需要先 clearRect
+        copyAreaSnapshotCtx.drawImage(canvas, 0, 0);
+
+        var dx = x_dest, dy = y_dest;
+        if (0 !== (anchor & HCENTER)) { dx -= ((width >>> 1) | 0); }
+        else if (0 !== (anchor & RIGHT)) { dx -= width; }
+        if (0 !== (anchor & VCENTER)) { dy -= ((height >>> 1) | 0); }
+        else if (0 !== (anchor & BOTTOM)) { dy -= height; }
+
+        c.drawImage(tmp, x_src, y_src, width, height, dx, dy, width, height);
+
+        var g = (typeof globalThis !== "undefined") ? globalThis : null;
+        if (g) {
+            g.__copyAreaN = (g.__copyAreaN | 0) + 1;
+            if (g.__copyAreaN === 1 && g.__sdMark) {
+                g.__sdMark("[gfx] copyArea 首次被调用（重叠安全复制 + clip 生效；屏幕 Graphics=" +
+                    (isScreenGraphics(self) ? "是（我们的屏幕 Graphics 就是 LCDUI 后备缓冲，允许自拷贝）" : "否") +
+                    "） src=" + x_src + "," + y_src + " " + width + "x" + height +
+                    " dst=" + dx + "," + dy + " anchor=" + anchor +
+                    " 画布=" + canvas.width + "x" + canvas.height);
+            }
+        }
     };
 
     Native["javax/microedition/lcdui/Graphics.setDimensions.(II)V"] = function(addr, w, h) {
@@ -1331,6 +1519,12 @@ var currentlyFocusedTextEditor;
         this.context.clip();
         this.context.translate(graphicsInfo.transX, graphicsInfo.transY);
 
+        // PATCH(perfZ42)：把当前裁剪区挂在 ctx 上，供 [draw] 轨迹探针读取（诊断用，不影响绘制）
+        this.context.__j2meClipX = graphicsInfo.clipX1;
+        this.context.__j2meClipY = graphicsInfo.clipY1;
+        this.context.__j2meClipW = graphicsInfo.clipX2 - graphicsInfo.clipX1;
+        this.context.__j2meClipH = graphicsInfo.clipY2 - graphicsInfo.clipY1;
+
         this.currentlyAppliedGraphicsInfo = graphicsInfo;
     };
 
@@ -1354,8 +1548,17 @@ var currentlyFocusedTextEditor;
         return g.displayId !== -1;
     }
 
+    // 2026-09-24 perfZ46：perfZ45 在这里暴露过 __j2meGetScreenCanvas / __j2meGetDeviceCanvas /
+    //   __j2meCanvasInfo 供宿主"帧落盘取证"用；该取证已按玩家要求整体删除（性能不足以边跑边取证），
+    //   三个全局钩子一并移除，避免留下无人使用的调试入口。
+
     Native["javax/microedition/lcdui/Graphics.setClip.(IIII)V"] = function(addr, x, y, w, h) {
         var info = NativeMap.get(addr);
+        if (traceArmed) {
+            traceDraw("CLIP", "set " + x + "," + y + " " + w + "x" + h +
+                      " (trans=" + info.transX + "," + info.transY + ")",
+                      info.contextInfo && info.contextInfo.context);
+        }
         info.setClip(x, y, w, h, 0, 0, info.contextInfo.context.canvas.width, info.contextInfo.context.canvas.height);
     };
 
@@ -1372,8 +1575,13 @@ var currentlyFocusedTextEditor;
         } catch (eSpy) { /* 诊断绝不影响渲染 */ }
 
         var finalText;
-        if (!emoji.regEx.test(str)) {
-            // No emojis are present.
+        // PATCH(perfZ38)：emoji 分支必须**先确认真的能画**。
+        // 事故（轩辕剑-天之痕，完整链条见 libs/emoji.js 顶部注释）：精灵图不在 romfs 里，
+        // 于是 emojiData.img 是个"没有任何解码产物的 Image" → drawImage 抛
+        // "Image or Canvas expected" → 异常冒到游戏里 → 游戏绘制/初始化线程挂掉、永远不出首帧。
+        // 现在：不支持 emoji（emoji.supported=false）或拿不到可用图像时，一律按普通文本绘制。
+        if (!emoji.supported || !emoji.regEx.test(str)) {
+            // No emojis are present (or emoji rendering isn't available in this build).
             finalText = str;
         } else {
             // Emojis are present. Handle all the text up to the last emoji.
@@ -1393,6 +1601,13 @@ var currentlyFocusedTextEditor;
                 x += measureWidth(c, text) | 0;
 
                 var emojiData = emoji.getData(match0, fontSize);
+                if (!emojiData || !emojiData.img) {
+                    // 拿不到精灵图：这段字符按普通文本画（缺字形顶多豆腐块，绝不抛异常）
+                    var charX = withTextAnchor(c, fontContext, anchor, x, match0);
+                    c.fillText(match0, charX, y);
+                    x += measureWidth(c, match0) | 0;
+                    continue;
+                }
                 c.drawImage(emojiData.img, emojiData.x, 0, emoji.squareSize, emoji.squareSize, x, y, fontSize, fontSize);
                 x += fontSize;
             }
@@ -1545,7 +1760,90 @@ var currentlyFocusedTextEditor;
     var TRANS_ROT270 = 6;
     var TRANS_MIRROR_ROT90 = 7;
 
+    // PATCH(perfZ42/perfZ43)：绘制轨迹探针（详见 renderRegion 里的说明）。
+    // **性能纪律**：探针默认全关，而且调用点必须先过 `traceArmed` 这个**模块内布尔量**——
+    // 否则 `traceDraw("REGION", "src=" + …)` 这种写法会**在每次绘制时都拼字符串**
+    // （笑傲武林是逐块贴图，一帧几百次），实测能把游戏拖慢到没法测。
+    // 宿主用 g.__setDrawTrace(true/false) 开关（traceArmed 随之翻转）。
+    var traceArmed = false;
+    var traceLinesThisTick = 0;
+    var traceTickAt = 0;
+    var selfBlitSnapshot = null;   // perfZ43：自拷贝用的复用快照画布（见 renderRegion）
+    function setDrawTrace(on) {
+        traceArmed = !!on;
+        traceLinesThisTick = 0;
+        if (typeof globalThis !== "undefined" && globalThis) globalThis.__drawTraceArmed = traceArmed;
+    }
+    function traceDraw(kind, detail, ctx) {
+        try {
+            if (!traceArmed) return;
+            var g = (typeof globalThis !== "undefined") ? globalThis : null;
+            if (!g || !g.__sdMark) return;
+            var now = Date.now();
+            if (now - traceTickAt > 200) { traceTickAt = now; traceLinesThisTick = 0; }
+            if (traceLinesThisTick >= 64) return;   // 限流：不把 SD 写爆、也不拖慢游戏
+            traceLinesThisTick++;
+            var clip = "";
+            if (ctx) {
+                clip = " clip=" + ctx.__j2meClipX + "," + ctx.__j2meClipY + " " +
+                       ctx.__j2meClipW + "x" + ctx.__j2meClipH;
+            }
+            g.__sdMark("[draw] " + kind + " " + detail + clip);
+        } catch (eTd) { /* 探针绝不干扰绘制 */ }
+    }
+
     function renderRegion(dstContext, srcCanvas, sx, sy, sw, sh, transform, absX, absY, anchor) {
+        // PATCH(perfZ42)：**绘制轨迹探针**（默认关，靠宿主置 g.__traceDraw + g.__traceDrawLeft 开启）。
+        // 由来：笑傲武林是"自带 int[] 软帧缓冲 + 只把变化的条带/子矩形上屏"的写法
+        // （见 PERF §49 的字节码分析）：它**依赖上一帧留在屏幕上的内容**，任何一笔子矩形/条带
+        // 贴图没落到位，旧像素就会留在屏幕上并持续累积 —— 正是玩家报的"剧情平移时残影"。
+        // 这条探针把"贴了哪一块、当时裁剪区多大"逐笔落盘，用来判定游戏的上屏覆盖是否完整。
+        if (traceArmed) {
+            traceDraw("REGION", "src=" + sx + "," + sy + " " + sw + "x" + sh + " → " + absX + "," + absY +
+                      " TRANS=" + transform, dstContext);
+        }
+        // PATCH(j2me-nx-port perfZ41)：**自拷贝 blit 必须先快照**。
+        //
+        // 实机症状（玩家补充的关键信息）：**自己走位/推镜头正常，只有"剧情强制移动镜头"时拖影**。
+        // 这种不对称正指向两种不同的绘制手法：
+        //   · 常规走位：每帧从地图 Image **整幅重画** → 没有自我拷贝，正常；
+        //   · 剧情平移：为了省 CPU，习惯用"把画面整体挪一格、只画新露出来的那条"的滚动写法，
+        //     在 MIDP 里就是 `scr = Image.createImage(w,h); g = scr.getGraphics();
+        //     g.drawRegion(scr, 0, dy, w, h-dy, TRANS_NONE, 0, 0, TOP|LEFT)` —— **把图拷到它自己身上**
+        //     （上游没实现 copyArea，所以老游戏普遍用这一招代替）。
+        //   而我们把这种重叠自拷贝直接交给 Skia：`ctx.drawImage(同一个 canvas, …)`。
+        //   Canvas2D 规范要求源数据"按调用那一刻的快照"读取，但 nx.js 的 canvas 可能把**活着的**表面
+        //   当源传下去 —— 于是边读边写、逐行涂开 = 内容被拖成重影，而且每挪一格就累积一次
+        //   ⇒ 正好是"系统平移镜头时旧位置擦不干净"。
+        // 处理：源画布 == 目标画布时，先把源快照到临时画布，再从快照画过去。
+        // 这符合 Canvas2D/MIDP 语义（快照读），对不重叠的自拷贝结果完全一致，代价只在真正自拷贝时付。
+        var g = (typeof globalThis !== "undefined") ? globalThis : null;
+        if (dstContext && srcCanvas && dstContext.canvas === srcCanvas) {
+            try {
+                // perfZ43：**复用同一张快照画布**（原来每次自拷贝都 new 一张 → 每帧新建画布，
+                // 在逐帧滚屏的游戏上就是持续的分配/GC 压力）。尺寸变化时才重建。
+                var snap = selfBlitSnapshot;
+                if (!snap || snap.width !== srcCanvas.width || snap.height !== srcCanvas.height) {
+                    snap = selfBlitSnapshot = document.createElement("canvas");
+                    snap.width = srcCanvas.width;
+                    snap.height = srcCanvas.height;
+                }
+                var snapCtx = snap.getContext("2d");
+                snapCtx.clearRect(0, 0, snap.width, snap.height);
+                snapCtx.drawImage(srcCanvas, 0, 0);
+                if (g) {
+                    g.__selfBlitN = (g.__selfBlitN | 0) + 1;
+                    if (g.__selfBlitN <= 3 && g.__sdMark) {
+                        g.__sdMark("[scroll] 自拷贝 blit（先快照再画） src=" + sx + "," + sy +
+                            " " + sw + "x" + sh + " → " + absX + "," + absY +
+                            " TRANS=" + transform + " 画布=" + srcCanvas.width + "x" + srcCanvas.height);
+                    }
+                }
+                srcCanvas = snap;
+            } catch (eSnap) {
+                if (g && g.__sdMark) g.__sdMark("[scroll] 自拷贝快照失败（继续用原画布）: " + (eSnap && eSnap.message));
+            }
+        }
         var w, h;
         switch (transform) {
             case TRANS_NONE:
@@ -1713,6 +2011,10 @@ var currentlyFocusedTextEditor;
         tempContext.putImageData(imageData, 0, 0);
 
         var c = NativeMap.get(addr).getGraphicsContext();
+        if (traceArmed) {
+            traceDraw("RGB", "buf " + width + "x" + height + " → " + x + "," + y +
+                      " alpha=" + processAlpha + " scan=" + scanlength, c);
+        }
 
         c.drawImage(tempContext.canvas, x, y);
         tempContext.canvas.width = 0;
@@ -2400,6 +2702,15 @@ var currentlyFocusedTextEditor;
 // PATCH(j2me-nx-port): 帧时间三分账探针——把全部 lcdui native 包上计时，
 // 累积到 jsGlobal.__gfxMsAcc（present 循环每 300 帧读取清零）。
 // 定位"卡顿到底花在解释器、LCDUI 绘制原语还是其他"的关键证据。
+//
+// PATCH(perfZ31)：同一个包装里顺手做**脏帧计数**（`__drawTick`）。
+// 由来：实机 [present] 账显示宿主呈现层每帧固定花 ~13ms 把游戏画布放大到竖屏窗口
+// （CPU 光栅 ≈33ns/像素）、再加 ~5ms 整屏上屏 = 18~19ms/帧，已经吃掉 60fps 整帧预算；
+// 而绝大多数帧里游戏**根本没画新东西**（UFO Afterlight 整局实测只有 ~8.8fps，
+// 它的逐字例程 PointFont.DrawChar 占 VM 时间 78%）⇒ 宿主白做了 6/7 的合成。
+// 计数语义：任何 lcdui native 被调用就 +1（含 getter，宁可多算不算少算 ——
+// 多算只会多合成一次，少算才会漏画面）；宿主比较前后计数，相同就跳过合成
+// （画面本来没变，视觉上完全等价），并每 12 帧强制合成一次兜底。
 (function () {
     var g = typeof globalThis !== "undefined" ? globalThis : null;
     if (!g) return;
@@ -2413,6 +2724,7 @@ var currentlyFocusedTextEditor;
         (function (fn) {
             Native[k] = function () {
                 var t0 = Date.now();
+                g.__drawTick = (g.__drawTick | 0) + 1;
                 try {
                     return fn.apply(this, arguments);
                 } finally {
@@ -2423,6 +2735,6 @@ var currentlyFocusedTextEditor;
         wrapped++;
     }
     if (typeof console !== "undefined" && console.log) {
-        console.log("[gfx-timing] 已包装 " + wrapped + " 个 lcdui native（帧时间三分账）");
+        console.log("[gfx-timing] 已包装 " + wrapped + " 个 lcdui native（帧时间三分账 + 脏帧计数）");
     }
 })();

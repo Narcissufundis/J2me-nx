@@ -651,7 +651,8 @@ module J2ME {
       calleeStats.interpreterCallCount++;
       if (config.forceRuntimeCompilation ||
           calleeStats.interpreterCallCount + calleeStats.backwardsBranchCount > invokeThresholdFor(methodInfo)) {
-        compileAndLinkMethod(methodInfo);
+        // PATCH(perfZ34)：只排队（见 runtime.ts requestCompile 说明）
+        if (config.forceRuntimeCompilation) { compileAndLinkMethod(methodInfo); } else { requestCompile(methodInfo); }
         if (methodInfo.state === MethodState.Compiled) {
           return methodInfo.fn.apply(null, arguments);
         }
@@ -762,6 +763,27 @@ module J2ME {
   // 键 = 方法 implKey，值 = { n 总次数, logged 已完整落盘次数, lastFlush 上次汇总时间 }。
   var trapStats: any = Object.create(null);
 
+  // PATCH(j2me-nx-port perfZ48)：把 catch 到的东西描述成人看得懂的一行。
+  // 三形态：① native 抛出的 **Java 异常对象句柄**（有 classInfo/_address，没 message/stack）
+  //        ② JS 级 Error（有 message/stack）③ 其它（数字/字符串）。
+  function describeTrapError(e: any): string {
+    try {
+      if (e === null || e === undefined) { return String(e); }
+      var t = typeof e;
+      if (t === 'string' || t === 'number' || t === 'boolean') { return String(e); }
+      var cls = e.classInfo && (e.classInfo.className || e.classInfo.name);
+      if (cls) { return 'java:' + cls + '(地址=' + e._address + ')'; }
+      if (e.message) { return String(e.message); }
+      if (e.stack) { return String(e.stack).split('\n')[0]; }
+      var keys = '';
+      try { keys = Object.keys(e).slice(0, 6).join(','); } catch (e3) { /* 忽略 */ }
+      var ctor = (e.constructor && e.constructor.name) || '?';
+      return '[object ' + ctor + (keys ? ' keys=' + keys : '') + ']';
+    } catch (e2) {
+      return '(无法描述)';
+    }
+  }
+
   function hangSample(mi: MethodInfo, pc: number, thread?: any, lp?: number, fp?: number) {
     try {
       var now = Date.now();
@@ -787,8 +809,13 @@ module J2ME {
           jsGlobal.__sdMark("[vm-sample] " + key + " (pc=" + pc + ")" + locDump);
         }
       }
-      if (key !== hangSampleKey) {
-        hangSampleKey = key;
+      // PATCH(perfZ36)：**同方法 ≠ 同一次调用**。上一版只比方法名，于是"游戏在一帧里
+      // 连调同一个热点方法十几秒"（UFO 的 PointFont.DrawChar 占采样 54~67%）被误报成
+      // `[hang-vm] 已连续运行 11.9s` —— 实机日志里那条把我和玩家都带偏了。现在把
+      // **pc 也纳入"同一个卡点"的判定**：同方法名但 pc 变了（=换了一次调用）就重新计时。
+      var site = key + '@' + pc;
+      if (site !== hangSampleKey) {
+        hangSampleKey = site;
         hangSampleT0 = now;
         hangSampleLastLog = 0;
         return;
@@ -797,7 +824,7 @@ module J2ME {
       if (stuck > 8000 && now - hangSampleLastLog > 5000) {
         hangSampleLastLog = now;
         if (jsGlobal && jsGlobal.__sdMark) {
-          jsGlobal.__sdMark("[hang-vm] 解释器在 " + key + " (pc=" + pc + ") 已连续运行 " + (stuck / 1000).toFixed(1) + "s" + locDump);
+          jsGlobal.__sdMark("[hang-vm] 解释器在 " + key + " (pc=" + pc + ") 同一处已连续采样 " + (stuck / 1000).toFixed(1) + "s" + locDump);
         }
       }
     } catch (e) { /* 日志系统绝不能引发二次崩溃 */ }
@@ -821,7 +848,9 @@ module J2ME {
     stats.backwardsBranchCount++;
     if (config.forceRuntimeCompilation || (mi.state === MethodState.Cold &&
         stats.interpreterCallCount + stats.backwardsBranchCount > ConfigThresholds.BackwardBranchThreshold)) {
-      compileAndLinkMethod(mi);
+      // PATCH(perfZ34)：只排队（编译统一在场间隙做，避免帧中间同步编译造成停顿/内存尖峰；
+      // 见 runtime.ts requestCompile 的说明）。forceRuntimeCompilation（工具链直编）仍同步编译。
+      if (config.forceRuntimeCompilation) { compileAndLinkMethod(mi); } else { requestCompile(mi); }
     }
   }
 
@@ -834,6 +863,91 @@ module J2ME {
   var hotSampleCount: number = 0;
   var hotLastFlush: number = 0;
 
+  // PATCH(perfZ32)：**热点定向编译**（tier=hot，profile-guided）。
+  // 由来：UFO Afterlight 实机 `[hot-top10]` 里 `PointFont.DrawChar` 常年占 VM 时间 66~78%
+  // 且一直是 `(st0)`（解释态）；而 tier=big（只编译 ≥512B 的大方法）对它无效 —— 说明这个
+  // 热点方法**小于 512 字节**，压根不在 big 档的适用范围内。反过来把阈值一律压到很小的值
+  // （当年 perfJ 的形态）会让大量小方法都进编译，实测"时不时卡顿"。
+  // 折中办法：不看方法大小，只看**采样器实测的热点**——每 30s 榜一刷新时，把榜上最热的
+  // 前 N 个仍在解释态的方编译掉（N 由 config.hotspotCompileLimit 控制，0=关）。
+  // 每会话编译数另有硬上限（24），编译本身走既有的"预算门 + 帧间隙 drainCompileQueue"，
+  // 不会在游戏帧中间同步编译。
+  var hotCompileDone: any = null;
+  var hotCompileCount = 0;
+  var hotLastCompileCheck = 0;
+  var jitCapNoted = false;   // perfZ35：上限提示只打一次
+  // PATCH(perfZ34)：**只排队，不在这里编译**。
+  // 实机事故：perfZ33 直接在采样钩子里同步跑 compileAndLinkMethod（一次最多 8 个），
+  // 等于在游戏帧中间做 8 次 Relooper 代码生成 → 长停顿 + 紧档下的大分配压力，
+  // 实机表现是"游戏加载中直接退出、日志没有任何 [exit] 行就断掉"。
+  // 现在这里只把方法塞进 pending 队列（O(1) 的 push），真正编译交给宿主帧间隙的
+  // drainCompileQueue（一次一个、有 maxMs 上限）。每次检查的排队数也收紧到 2 个。
+  function maybeCompileHotspots(arr: any []) {
+    var limit = ConfigThresholds.HotspotCompileLimit | 0;
+    if (limit <= 0) return;
+    // PATCH(perfZ35): 全会话上限（config.jitCompileCap，紧档减半）到了一个就不再排队。
+    // 由来：perfZ32~Z34 里"紧档每会话 ≤8"只管住了这条采样路径，解释器阈值那条路照样编了
+    // 29 个（见 PERF §42）——现在上限统一在 runtime 的编译入口判定，这里只是不再白排队。
+    var remaining = jitCompileRemaining();
+    if (remaining === 0) {
+      if (!jitCapNoted) {
+        jitCapNoted = true;
+        if (jsGlobal && jsGlobal.__sdMark) {
+          jsGlobal.__sdMark("[jit-hot] 已达本会话编译上限（" + (ConfigThresholds.JitCompileCap | 0) +
+            " 个），后续热点只记录不编译");
+        }
+      }
+      return;
+    }
+    // 紧档（宿主在 app/main.js 里判定 limit<700MB 时置位）：排得更少、更保守
+    var tight = !!(jsGlobal && jsGlobal.__memTight);
+    if (tight && limit > 2) limit = 2;
+    if (!hotCompileDone) hotCompileDone = {};
+    var queuedThisRound = 0;
+    for (var i = 0; i < arr.length && i < limit && queuedThisRound < 2; i++) {
+      var rec = arr[i][1];
+      var mi = rec.mi;
+      if (!mi || mi.state !== MethodState.Cold) continue;
+      // tier=big：只编 ≥512B 的（小方法留在解释器里，避免 perfJ 那种"小方法编译太频繁"）
+      if (ConfigThresholds.JitBigOnly && mi.codeAttribute && mi.codeAttribute.code.length < 512) continue;
+      var key = arr[i][0];
+      if (hotCompileDone[key]) continue;
+      if (hotCompileCount >= (tight ? 4 : 12)) break;   // perfZ35：自身上限收紧（原来 8/24）
+      if (remaining > 0 && hotCompileCount >= remaining) break;
+      hotCompileDone[key] = true;
+      hotCompileCount++;
+      queuedThisRound++;
+      try {
+        if (jsGlobal && jsGlobal.__sdMark) {
+          jsGlobal.__sdMark("[jit-hot] 排入编译队列 #" + hotCompileCount + " " + key +
+            " 占比=" + Math.round(rec.n * 100 / Math.max(1, hotSampleCount)) +
+            "% size=" + (mi.codeAttribute ? mi.codeAttribute.code.length : -1) +
+            " calls=" + mi.stats.interpreterCallCount +
+            " bb=" + mi.stats.backwardsBranchCount +
+            (tight ? " [紧档：本轮最多 2 个]" : ""));
+        }
+      } catch (eLH) { /* 日志故障不干扰 */ }
+      requestCompile(mi);   // 只排队；编译在场间隙做（见 runtime.ts requestCompile 的说明）
+    }
+  }
+
+  // PATCH(perfZ32b)：**快速爬坡**。原来只在 30s 榜刷新时才检查热点，导致一局游戏的前 30 秒
+  // 完全没编译（而重载游戏的卡顿恰恰集中在刚进场景那段时间）。现在每 10s 用**当前累积的
+  // 采样**做一次检查（不清空累积），榜刷新时再做一次完整检查。
+  function hotCompileTick() {
+    try {
+      if ((ConfigThresholds.HotspotCompileLimit | 0) <= 0) return;
+      if (!hotSamples) return;
+      var now = Date.now();
+      if (hotSampleCount < 8 || now - hotLastCompileCheck < 10000) return;
+      hotLastCompileCheck = now;
+      var arr: any [] = [];
+      for (var k in hotSamples) arr.push([k, hotSamples[k]]);
+      arr.sort(function (a: any, b: any) { return b[1].n - a[1].n; });
+      maybeCompileHotspots(arr);
+    } catch (eHC2) { /* 不影响游戏 */ }
+  }
+
   function hotSample(mi: MethodInfo) {
     try {
       if (!hotSamples) hotSamples = {};
@@ -844,7 +958,9 @@ module J2ME {
       }
       rec.n++;
       rec.st = mi ? mi.state : -1;
+      rec.mi = mi;   // perfZ32：留引用给"热点定向编译"用
       hotSampleCount++;
+      hotCompileTick();
       var now = Date.now();
       if (hotSampleCount >= 32 && now - hotLastFlush > 30000) {
         hotLastFlush = now;
@@ -854,10 +970,14 @@ module J2ME {
         var line = "[hot-top10] n=" + hotSampleCount;
         var n = arr.length < 10 ? arr.length : 10;
         for (var i = 0; i < n; i++) {
-          // PATCH(j2me-nx-port): 附加采样时方法状态，判别"未触发编译"还是"编译后仍回解释"
-          line += " | " + arr[i][0] + "=" + Math.round(arr[i][1].n * 100 / hotSampleCount) + "%(st" + arr[i][1].st + ")";
+          // PATCH(j2me-nx-port): 附加采样时方法状态，判别"未触发编译"还是"编译后仍回解释"；
+          // perfZ32 再加**字节码长度** len= —— 直接回答"这个方法够不够大、属于哪一档阈值"。
+          var m2 = arr[i][1].mi;
+          line += " | " + arr[i][0] + "=" + Math.round(arr[i][1].n * 100 / hotSampleCount) +
+            "%(st" + arr[i][1].st + "/len=" + (m2 && m2.codeAttribute ? m2.codeAttribute.code.length : -1) + ")";
         }
         if (jsGlobal && jsGlobal.__sdMark) jsGlobal.__sdMark(line);
+        try { maybeCompileHotspots(arr); } catch (eHC) { /* 定向编译故障不影响游戏 */ }
         hotSamples = {};
         hotSampleCount = 0;
       }
@@ -902,7 +1022,8 @@ module J2ME {
     mi.stats.interpreterCallCount++;
     if (config.forceRuntimeCompilation || (mi.state === MethodState.Cold &&
         mi.stats.interpreterCallCount + mi.stats.backwardsBranchCount > invokeThresholdFor(mi))) {
-      compileAndLinkMethod(mi);
+      // PATCH(perfZ34)：只排队，不做帧中间同步编译（见 runtime.ts requestCompile）
+      if (config.forceRuntimeCompilation) { compileAndLinkMethod(mi); } else { requestCompile(mi); }
       // TODO call the compiled method.
     }
     var maxLocals = mi.codeAttribute.max_locals;
@@ -3063,7 +3184,8 @@ module J2ME {
               mi.stats.backwardsBranchCount++;
               if (config.forceRuntimeCompilation || (mi.state === MethodState.Cold &&
                   mi.stats.interpreterCallCount + mi.stats.backwardsBranchCount > ConfigThresholds.BackwardBranchThreshold)) {
-                compileAndLinkMethod(mi);
+                // PATCH(perfZ34)：只排队，不做帧中间同步编译（见 runtime.ts requestCompile）
+                if (config.forceRuntimeCompilation) { compileAndLinkMethod(mi); } else { requestCompile(mi); }
               }
               if (enableOnStackReplacement && mi.state === MethodState.Compiled) {
                 // Just because we've jumped backwards doesn't mean we are at a loop header but it does mean that we are
@@ -3851,7 +3973,8 @@ module J2ME {
             if (callMethod === false) {
               if (config.forceRuntimeCompilation || (calleeTargetMethodInfo.state === MethodState.Cold &&
                   calleeStats.interpreterCallCount + calleeStats.backwardsBranchCount > invokeThresholdFor(calleeTargetMethodInfo))) {
-                compileAndLinkMethod(calleeTargetMethodInfo);
+                // PATCH(perfZ34)：只排队，不做帧中间同步编译（见 runtime.ts requestCompile）
+                if (config.forceRuntimeCompilation) { compileAndLinkMethod(calleeTargetMethodInfo); } else { requestCompile(calleeTargetMethodInfo); }
                 callMethod = calleeTargetMethodInfo.state === MethodState.Compiled;
               }
             }
@@ -4026,7 +4149,12 @@ module J2ME {
         __ts.n++;
         if (jsGlobal && jsGlobal.__sdMark && __ts.logged < 3) {
           __ts.logged++;
-          jsGlobal.__sdMark("[jit-trap] method=" + __trapKey + " pc=" + opPC + " err=" + (e && e.message || e));
+          // PATCH(j2me-nx-port perfZ48)：**把 Java 异常对象描述成人看得懂的东西**。
+          // 由来：宠物王国4-白金的黑屏根因（copyArea 抛 IllegalStateException）就是靠这条
+          // 日志定位的，但它当时打的是 `err=[object Object]` —— 因为 native 抛的是
+          // `$.ctx.createException()` 造出来的 **Java 对象句柄**（有 _address / classInfo，
+          // 没有 message/stack）。现在优先打 Java 类名，其次才是 JS 错误的 message/stack。
+          jsGlobal.__sdMark("[jit-trap] method=" + __trapKey + " pc=" + opPC + " err=" + describeTrapError(e));
           // PATCH(j2me-nx-port): 堆栈前 4 帧定位炸点在哪个编译方法里
           var __trapStack = (e && e.stack) ? String(e.stack).split("\n").slice(0, 4).join(" || ") : "";
           if (__trapStack) jsGlobal.__sdMark("[jit-trap] at " + __trapStack);

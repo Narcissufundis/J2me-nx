@@ -8,9 +8,18 @@ import path from 'path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const JAVA = path.join(ROOT, 'java');
-// JDK 路径：优先环境变量 JDK_BIN（别的机器/CI 上必须能指定），否则用作者本机的默认位置。
+// JDK 路径：优先环境变量 JDK_BIN（别的机器/CI 上必须能指定），其次 JAVA_HOME/bin，
+// 最后才回落作者本机默认位置。
 // ⚠ 需要 **JDK 8**（javac -source 1.3 -target 1.3 + -bootclasspath ""）。
-const JDK = process.env.JDK_BIN || 'D:/j2me/jdk1.8.0_281/bin';
+// PATCH(perfZ49)：工具名后缀按平台取 —— Windows 是 `javac.exe`，POSIX 是 `javac`。
+// 由来：仓库发布时带上了 .github/workflows/ci.yml（ubuntu-latest），而本文件原先写死 `.exe`，
+// CI 上必然 "command not found"。保持 Windows 行为不变（win32 仍取 .exe）。
+const JDK = process.env.JDK_BIN ||
+  (process.env.JAVA_HOME ? path.join(process.env.JAVA_HOME, 'bin') : 'D:/j2me/jdk1.8.0_281/bin');
+const EXE = process.platform === 'win32' ? '.exe' : '';
+const JAVAC = `${JDK}/javac${EXE}`;
+const JAR = `${JDK}/jar${EXE}`;
+const JAVAP = `${JDK}/javap${EXE}`;
 const DIRS = ['cldc1.1.1', 'vm', 'midp', 'custom', 'jsr-256', 'jsr-179', 'jsr-082'];
 const skipCompile = process.argv.includes('--skip-compile');
 
@@ -45,7 +54,7 @@ console.log('[1] build-src 汇集完成，java 文件:', files.length);
 if (!skipCompile) {
   fs.rmSync(path.join(JAVA, 'build'), { recursive: true, force: true });
   fs.mkdirSync(path.join(JAVA, 'build'));
-  sh(`"${JDK}/javac.exe" -encoding UTF-8 -nowarn -Xlint:none -cp build-src -g:none -source 1.3 -target 1.3 -bootclasspath "" -extdirs "" -d ./build @build-srcs.txt`);
+  sh(`"${JAVAC}" -encoding UTF-8 -nowarn -Xlint:none -cp build-src -g:none -source 1.3 -target 1.3 -bootclasspath "" -extdirs "" -d ./build @build-srcs.txt`);
   console.log('[2] javac 完成（-encoding UTF-8）');
 } else {
   console.log('[2] 跳过编译 (--skip-compile)');
@@ -53,14 +62,14 @@ if (!skipCompile) {
 
 // 3) 打 jar
 process.chdir(path.join(JAVA, 'build'));
-sh(`"${JDK}/jar.exe" cf0 ../classes.jar .`);
+sh(`"${JAR}" cf0 ../classes.jar .`);
 process.chdir(JAVA);
 console.log('[3] jar cf0 完成');
 
 // 4) 注入 prebuilt class（无源码的类：GBK Reader 等）
 if (fs.existsSync(path.join(JAVA, 'prebuilt-classes'))) {
   process.chdir(path.join(JAVA, 'prebuilt-classes'));
-  sh(`"${JDK}/jar.exe" uf0 ../classes.jar com`);
+  sh(`"${JAR}" uf0 ../classes.jar com`);
   process.chdir(JAVA);
   console.log('[4] prebuilt-classes 注入完成');
 }
@@ -68,7 +77,7 @@ if (fs.existsSync(path.join(JAVA, 'prebuilt-classes'))) {
 // 5) l10n 资源
 const l10n = fs.existsSync(path.join(JAVA, 'l10n')) ? fs.readdirSync(path.join(JAVA, 'l10n')).filter(f => f.endsWith('.json')) : [];
 if (l10n.length) {
-  sh(`"${JDK}/jar.exe" uf0 classes.jar ${l10n.map(f => 'l10n/' + f).join(' ')}`);
+  sh(`"${JAR}" uf0 classes.jar ${l10n.map(f => 'l10n/' + f).join(' ')}`);
   console.log('[5] l10n 资源注入:', l10n.join(', '));
 }
 
@@ -90,14 +99,14 @@ process.chdir(VERIFY_DIR);
 // ⚠️ 文本输入补丁在 **内部类** Display$DisplayEventConsumerImpl 里（handleInputMethodEvent /
 // handleCommandEvent 都在那），不是外层 Display —— 只反汇编外层会"验证通过"但什么都没查到。
 const CONSUMER_CLASS = 'javax/microedition/lcdui/Display$DisplayEventConsumerImpl.class';
-sh(`"${JDK}/jar.exe" xf ../classes.jar javax/microedition/lcdui/Display.class javax/microedition/lcdui/Displayable.class "${CONSUMER_CLASS}" com/sun/cldc/io/ResourceInputStream.class java/io/InputStream.class`);
-const disDisplay = sh(`"${JDK}/javap.exe" -p -c javax/microedition/lcdui/Display.class`);
-const disDisplayable = sh(`"${JDK}/javap.exe" -p -c javax/microedition/lcdui/Displayable.class`);
-const disConsumer = sh(`"${JDK}/javap.exe" -p -c "${CONSUMER_CLASS}"`);
+sh(`"${JAR}" xf ../classes.jar javax/microedition/lcdui/Display.class javax/microedition/lcdui/Displayable.class "${CONSUMER_CLASS}" com/sun/cldc/io/ResourceInputStream.class java/io/InputStream.class`);
+const disDisplay = sh(`"${JAVAP}" -p -c javax/microedition/lcdui/Display.class`);
+const disDisplayable = sh(`"${JAVAP}" -p -c javax/microedition/lcdui/Displayable.class`);
+const disConsumer = sh(`"${JAVAP}" -p -c "${CONSUMER_CLASS}"`);
 // ⚠️ 包名是 com/sun/cldc/io（源码放在 java/custom/com/sun/cldchi/io/ 目录下，
 //    但 package 声明是 com.sun.cldc.io）—— 目录名带 "hi" 会 jar xf 找不到（踩过）。
-const disResIn = sh(`"${JDK}/javap.exe" -p -c com/sun/cldc/io/ResourceInputStream.class`);
-const disInputStream = sh(`"${JDK}/javap.exe" -p -c java/io/InputStream.class`);
+const disResIn = sh(`"${JAVAP}" -p -c com/sun/cldc/io/ResourceInputStream.class`);
+const disInputStream = sh(`"${JAVAP}" -p -c java/io/InputStream.class`);
 // 中文诊断字面量不能在 javap 输出里匹配：JDK8 的 javap 按 Windows 控制台代码页
 // （cp936）输出，管道里拿到的是 GBK 字节，用 UTF-8 正则去匹配永远不中（踩过一次）。
 // 直接查 class 文件字节里的 UTF-8 序列，与代码页无关。
@@ -138,7 +147,7 @@ let bad = 0;
 for (const [name, ok] of checks) { console.log((ok ? 'OK  ' : 'FAIL ') + name); if (!ok) bad++; }
 
 // 条目验证
-const entries = execSync(`"${JDK}/jar.exe" tf data/java/classes.jar`, { cwd: ROOT }).toString().split(/\r?\n/).filter(l => l.trim());
+const entries = execSync(`"${JAR}" tf data/java/classes.jar`, { cwd: ROOT }).toString().split(/\r?\n/).filter(l => l.trim());
 const need = [
   'com/sun/cldc/i18n/j2me/GBK_Reader.class',
   'com/sun/midp/l10n/LocalizedStrings_zh_CN.class',

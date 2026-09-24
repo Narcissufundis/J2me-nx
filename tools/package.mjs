@@ -38,6 +38,7 @@ function copy(relSrc, relDst) {
 }
 
 console.log('[package] 复制宿主层与 VM 产物 ...');
+copy('src/host/bytes.js', 'host/bytes.js');   // PATCH(perfZ26)：__toU8 类型规整（ArrayBuffer → Uint8Array）
 copy('src/host/png-decoder.js', 'host/png-decoder.js');
 copy('src/host/mask-scan.js', 'host/mask-scan.js');
 copy('src/host/env-prelude.js', 'env-prelude.js');
@@ -103,6 +104,20 @@ console.log('[package] 竖屏遮罩图（1280x720 RGBA 裸数据，白区透明�
 
 // nx.js 运行时配置：libuv 线程池 size=1（规避 beta.6 libuv-worker condvar 崩溃竞态）
 copy('data/nxjs.ini', 'nxjs.ini');
+// PATCH(perfZ44)：**stock runtime 构建开关**（外部评审的"默认配置依赖仓库外二进制"问题）。
+// 背景：data/nxjs.ini 默认 `[v8] jit = on`，只有**打过 W^X 补丁**的 nx.js 运行时能用
+// （官方运行时配 jit=on 在 Switch 上分配 JIT 代码页即 Data Abort）。发版二进制自带那份补丁运行时
+// （dist/nxjs-v<版本>.nro，见 NOTICE），但从源码构建、手上只有官方运行时的贡献者会直接踩坑。
+// 用法：J2ME_STOCK_RUNTIME=1 node tools/package.mjs  → 把 romfs 里的 nxjs.ini 改成 jit = off，
+// 于是**官方运行时也能开**（慢一些，但不会 Data Abort）。这样"公开源码的默认构建"就有了
+// 一条明确、可复现的 stock 路线，而我们的发版流程保持原样（未设该变量时行为不变）。
+if (process.env.J2ME_STOCK_RUNTIME) {
+  const iniPath = join(romfs, 'nxjs.ini');
+  const ini = readFileSync(iniPath, 'utf8')
+    .replace(/^(\s*jit\s*=\s*)on\s*$/m, '$1off');
+  writeFileSync(iniPath, ini);
+  console.log('  [stock] J2ME_STOCK_RUNTIME=1 → romfs/nxjs.ini 的 [v8] jit 已改为 off（适配官方运行时）');
+}
 
 console.log('[package] esbuild 打包入口 app/main.js -> romfs/main.js');
 const esbuild = join(root, 'tools', 'node_modules', 'esbuild', 'bin', 'esbuild');

@@ -24,6 +24,35 @@ The whole virtual machine is written in JavaScript and runs as homebrew on Atmos
 安装：把 `J2me-nx.nro` 放到 `sdmc:/switch/`，游戏 `.jar` 放到 `sdmc:/switch/java/`。
 Install: copy `J2me-nx.nro` to `sdmc:/switch/` and your game `.jar` files to `sdmc:/switch/java/`.
 
+三种装法，按需求挑一种 / Three ways to install — pick one:
+
+| 装法 / Route | 需要什么 / What you need | 启动方式 / How it starts | 适合谁 / For whom |
+|---|---|---|---|
+| **NRO（最简单）** | `J2me-nx.nro` → `sdmc:/switch/` | hbmenu（applet 模式，≈425MB 内存、CPU 光栅）/ hbmenu (applet, ~425 MB, CPU raster) | 先试玩、不想装东西 / trying it out |
+| **前端 NSP（最省空间）** | `dist/forwarder/J2me-nx-forwarder.nsp`（322KB）装成标题，NRO 仍在 `sdmc:/switch/J2me-nx.nro` | 主页图标 / home-menu icon，**application 模式** | 想要主页图标又不想占空间 / want a home icon without the bulk |
+| **完整 NSP（最省事）** | `J2me-nx.nsp`（≈49MB）装成标题 + 共享运行时 / installed title + shared runtime | 主页图标 / home-menu icon，**application 模式** | 一步到位 / the one-step route |
+
+后两种都需要 SD 上的共享运行时 `sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro`（`npm run nsp` 会把它发到 `dist/`）。
+前端 NSP 里的 NRO 路径是**硬编码**的，所以 `sdmc:/switch/J2me-nx.nro` 这个名字不能改、文件不能挪走。
+Both latter routes also need the shared runtime at `sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro` (`npm run nsp`
+emits it into `dist/`). The forwarder hardcodes the NRO path, so `sdmc:/switch/J2me-nx.nro` must keep
+that exact name and location.
+
+**NRO 与 NSP 的区别（重要）**：NRO 是自制程序，用 hbmenu 启动（applet 模式，内存约 425MB、画布走 CPU 光栅）；
+NSP 装成标题后从主页启动，是 **application 模式（内存约 3GB + GPU 画布）**，画面拷贝便宜得多、更流畅。
+NSP 是 **slim** 形态：安装包本身只有约 49MB，**必须**在 SD 上放一份共享运行时
+（`sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro`，`npm run nsp` 会把它一并发到 `dist/`）——那份是打过
+W^X 补丁的运行时，配 `nxjs.ini` 的 `jit = on` 才安全；用官方未打补丁的运行时启动会直接崩溃。
+NRO/NSP 两种形态的游戏、存档、SD 目录完全一致。
+
+**NRO vs NSP (important)**: the NRO is a homebrew app launched from hbmenu (applet mode, ~425 MB and a
+CPU-raster canvas); an installed NSP is launched from the home menu as an **application** (~3 GB of
+memory and a GPU canvas), which makes frame composition much cheaper and smoother. The NSP is **slim**:
+the package is only ~49 MB and **requires** a shared runtime on the SD card
+(`sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro`; `npm run nsp` emits it into `dist/`) — that build carries the
+W^X patch, which is what makes `jit = on` in `nxjs.ini` safe. The official unpatched runtime crashes
+at boot. Games, saves and SD-card layout are identical for both forms.
+
 ---
 
 ## 2. 优势 / Advantages
@@ -145,6 +174,7 @@ Remap buttons via `Y` → **Key mapping**; stored in `sdmc:/switch/j2me-nx/keys.
 ```
 sdmc:/switch/J2me-nx.nro                  程序本体 / the emulator itself
 sdmc:/switch/java/*.jar                   游戏放这里 / put your games here
+sdmc:/nx.js/nxjs-v1.0.0-beta.6.nro        共享运行时（NSP 或前端 NSP 需要）/ shared runtime (needed by the NSP or the forwarder)
 sdmc:/switch/j2me-nx/keys.txt             按键映射 / key mapping
 sdmc:/switch/j2me-nx/keyprofiles.json     每游戏的按键机型 / per-game key profile
 sdmc:/switch/j2me-nx/names.txt            游戏显示名（改名用）/ display names (rename)
@@ -154,6 +184,11 @@ sdmc:/switch/j2me-nx/lang.json            界面语言 / UI language
 sdmc:/switch/j2me-nx/save/<游戏名>/idb-fs.json   存档 / save data
 sdmc:/switch/j2me-nx/error.log            运行日志（排障用）/ runtime log (for troubleshooting)
 ```
+
+装了「前端 NSP」的话，`sdmc:/switch/J2me-nx.nro` 这个名字**不能改**（前端里是硬编码的）；
+带构建标记的 `J2me-nx-<标记>.nro` 只用来在 hbmenu 里并排测试新旧版本。
+With the forwarder NSP, `sdmc:/switch/J2me-nx.nro` **must keep that name** (it is hardcoded inside the
+forwarder); the stamped `J2me-nx-<tag>.nro` copies exist only for A/B testing through hbmenu.
 
 ---
 
@@ -189,8 +224,21 @@ Daily regression: `npm test` — runs the whole simulation suite and assertions 
   Multi-second stalls at entry/loading (interpreted execution), same when loading new scenes.
 - 内存档位随机：紧档时自定义 PNG 遮罩被跳过；想拿到正常档可退出重开，直到日志出现 `★档位=正常`。
   Random memory tier: in the tight tier custom PNG masks are skipped; relaunch until the log shows the normal tier.
-- 连续换游戏可能静默退出：建议换 2 次后重开一次程序。
-  Repeated game switching may exit silently: restart the app after ~2 switches.
+- 已知限制：连续换游戏约 2 次后可能静默退出（换 2 次后重开一次程序即可继续）。
+  Known limitation: repeated game switching may exit silently after ~2 switches (relaunching the app
+  after 2 switches continues normally).
+- **JIT 是实验开关，默认关闭**：`sdmc:/switch/j2me-nx/jit-big` 存在且写着 `hot`/`big`/`all` 才会开。
+  2026-09-24 实机复核发现该开关的 `hot` 档当时会被"任何 ≥512B 方法调用 3 次就编译"带偏
+  （一次 9 分钟的游戏里编了 29 个方法、含 9KB 方法单次 103ms），随后出现静默退出；
+  现在的版本只按采样热点编译、全会话硬上限 8 个（偏紧档 4 个），并且**偏紧档一律强制关闭 JIT**。
+  想稳定就别放这个文件；崩溃取证请附日志最后 30 秒（`[jit-pre]/[jit-post]` 会写明编译时的堆）。
+  **JIT is an experimental switch, off by default**: it only turns on when
+  `sdmc:/switch/j2me-nx/jit-big` exists and names a tier (`hot`/`big`/`all`). A 2026-09-24 review found the
+  `hot` tier was silently compiling *any* method ≥512B after 3 calls (29 methods in one 9-minute session,
+  including a 9 KB method at 103 ms), followed by silent exits; the current build compiles only
+  profile-sampled hotspots with a hard cap of 8 per session (4 in the tight memory tier) and force-disables
+  JIT entirely in that tier. Leave the file absent for stability; crash reports should include the last
+  30 s of the log (`[jit-pre]`/`[jit-post]` record the heap at compile time).
 - 少数游戏进图/进战斗时可能长时间无响应（资源过大或 API 缺失）。
   A few games hang for a long time when loading a map/battle (oversized resources or missing APIs).
 - 若界面语言切换后提示「写盘失败」，说明 SD 卡写入有问题，日志里会写明原因。

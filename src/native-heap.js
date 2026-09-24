@@ -17,8 +17,12 @@
  * 设计要点（对照原版语义）：
  *  - NULL = 0：堆前 4KB 永不分配，malloc 返回 0 表示 OOM（runtime.ts 依赖此约定）。
  *  - 所有分配 8 字节对齐（Boehm 语义；Int32Array 视图也要求 4 对齐）。
- *  - _gcMalloc 分配清零（Boehm GC_malloc 语义）；_gcFree 是 no-op（Boehm 忽略 free），
- *    即"不回收的 bump 分配器"——地址永不复用，因此 WeakReference 永不误悬垂（先求对，再求省）。
+ *  - _gcMalloc 分配清零（Boehm GC_malloc 语义）。
+ *    ⚠️ **勘误（perfZ44，外部评审指出注释与实现漂移）**：本文件早期版本里 free 是 no-op、
+ *    堆是"不回收的 bump 分配器"；**现在不是了** —— 后面已包含完整的保守 mark/sweep、
+ *    freelist、弱引用处理与 `_gcFree` 的**延迟回收**语义（见下方 PATCH(perfA…) 各段与
+ *    `_forceCollection`）。地址**会**被复用，所以 WeakReference/消失链接必须走
+ *    `_gcRegisterDisappearingLink` + 本文件的弱引用清理流程（不要再按"地址永不复用"推理）。
  *  - 长整数运算用 i32 lo/hi 对实现，除/乘走 BigInt 保证 Java 截断与回绕语义。
  *
  * 配置：加载本文件前可设置全局 ASM_CONFIG = { memoryBytes: N, maxMemoryBytes: M }
@@ -38,7 +42,8 @@
 
   // 堆起始地址：跳过前 4KB，保证 0（NULL）与低地址永不出现在分配结果里。
   var HEAP_START = 4096;
-  // 8 字节对齐的 bump 分配器。
+  // bump 游标：仅在 freelist 找不到合适块时向前推进（早期版本是无回收的纯 bump 分配器，
+  // 现在配合下面的 freelist 做复用 —— 别按"只增不减"读这段代码）。
   var bump = HEAP_START;
 
   // PATCH(j2me-nx-port): 可扩容堆。bump 分配器不回收，128MB 固定堆在长游玩

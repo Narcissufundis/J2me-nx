@@ -8,11 +8,12 @@
   "nacp": {
     "title": "J2me-nx"
   },
+  "//devDependencies": "工具链在 tools/package.json（唯一权威依赖清单）：cd tools && npm install。根目录刻意不放 devDependencies —— 外部评审指出，这里曾有一份过时的 @nx.js/* ^0.1.1 / esbuild ^0.25.0，与构建实际使用的 beta.6 / ^0.28.2 不一致，会让新贡献者 npm install 出一套用不上的依赖。",
   "scripts": {
     "build": "node tools/build.mjs",
     "romfs": "node tools/package.mjs",
     "simulate": "node tools/simulate.mjs",
-    "test": "node tests/native-heap.test.mjs && node tests/gbk-table.test.mjs && node tests/samsung-api.test.mjs && node tests/midi-zip-hardening.test.mjs && node tests/mask-assets.test.mjs && node tests/nokia-natives.test.mjs && node tests/native-png-gate.test.mjs && node tests/panel-layout.test.mjs && node tests/ui-lang.test.mjs && node tools/test-tonebank.mjs && node tools/simulate.mjs && node tools/test-text-ok.mjs && node tools/test-menu.mjs && node tools/test-uilang.mjs && node tools/test-skipfast.mjs && node tools/test-softrestart.mjs && node tools/test-nokia-dg.mjs && node tools/test-samsung-api.mjs && node tools/test-encoding.mjs",
+    "test": "node tests/native-heap.test.mjs && node tests/gbk-table.test.mjs && node tests/samsung-api.test.mjs && node tests/midi-zip-hardening.test.mjs && node tests/mask-assets.test.mjs && node tests/nokia-natives.test.mjs && node tests/native-png-gate.test.mjs && node tests/readfile-contract.test.mjs && node tests/font-coverage.test.mjs && node tests/panel-layout.test.mjs && node tests/ui-lang.test.mjs && node tests/emoji-fallback.test.mjs && node tests/frame-boundary.test.mjs && node tools/test-tonebank.mjs && node tools/simulate.mjs && node tools/test-text-ok.mjs && node tools/test-menu.mjs && node tools/test-uilang.mjs && node tools/test-skipfast.mjs && node tools/test-softrestart.mjs && node tools/test-nokia-dg.mjs && node tools/test-samsung-api.mjs && node tools/test-encoding.mjs && node tests/packaged-artifacts.test.mjs",
     "test:restart": "node tools/test-softrestart.mjs",
     "test:skip": "node tools/fixture/build.mjs && node tools/skip-test/build.mjs && node tools/test-skipfast.mjs",
     "test:uilang": "node tests/ui-lang.test.mjs && node tools/test-uilang.mjs",
@@ -24,14 +25,10 @@
     "test:nokia": "node tests/nokia-natives.test.mjs && node tools/test-nokia-dg.mjs",
     "test:layout": "node tests/panel-layout.test.mjs",
     "nro": "node tools/package.mjs && node tools/node_modules/@nx.js/nro/dist/main.js --fat && node tools/pack-output.mjs nro",
-    "nsp": "node tools/package.mjs && node tools/node_modules/@nx.js/nsp/dist/main.js --fat && node tools/pack-output.mjs nsp",
-    "release": "npm run nro"
-  },
-  "devDependencies": {
-    "@nx.js/nro": "^0.1.1",
-    "@nx.js/nsp": "^0.1.1",
-    "@nx.js/runtime": "^0.1.1",
-    "esbuild": "^0.25.0",
-    "typescript": "^2.9.2"
+    "nsp": "node tools/package.mjs && node tools/node_modules/@nx.js/nsp/dist/main.js --slim && node tools/pack-output.mjs nsp && node tools/verify-nsp.mjs",
+    "release": "npm run nro",
+    "forwarder": "node tools/pack-forwarder.mjs",
+    "verify:nsp": "node tools/verify-nsp.mjs",
+    "test:artifacts": "node tests/packaged-artifacts.test.mjs"
   }
 }

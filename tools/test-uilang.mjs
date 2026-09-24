@@ -69,6 +69,11 @@ const defaultLangFile = join(root, 'data', 'lang.json');
 process.env.J2ME_TEST_GAMEDIR = gameDir;
 process.env.J2ME_TEST_MENU = '1';
 process.env.J2ME_TEST_LANG_FILE = langFile;
+// perfZ26：仿真保真开关 —— 把 Node 的 Buffer 换成实机那样的 ArrayBuffer 再喂给读盘入口。
+// 事故回顾：实机 Switch.readFileSync 返回 ArrayBuffer（**没有 .length**），而仿真返回
+// Buffer（有 .length），于是"语言/按键映射/按键机型读不回来"这个 bug 在仿真里全绿、
+// 在实机上三个功能全废。打开这个开关后，本端到端测试跑的就是实机的输入形态。
+process.env.J2ME_TEST_ARRAYBUFFER = '1';
 // 防御：仓库里真有一份 lang.json=en 的话，本测试的结论会被它带偏
 try { if (existsSync(defaultLangFile)) unlinkSync(defaultLangFile); } catch (e) { /* 忽略 */ }
 

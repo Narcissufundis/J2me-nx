@@ -38,6 +38,8 @@ rmSync(gameDir, { recursive: true, force: true });
 mkdirSync(gameDir, { recursive: true });
 for (let i = 0; i < 3; i++) copyFileSync(srcJar, join(gameDir, 'SR' + i + '_test.jar'));
 process.env.J2ME_TEST_GAMEDIR = gameDir;
+// perfZ26：仿真保真 —— 读盘结果按实机形态（ArrayBuffer）交给宿主（见 tests/readfile-contract.test.mjs）
+process.env.J2ME_TEST_ARRAYBUFFER = '1';
 
 // [session] 账本落在 data/error.log（sdLog），记下起点只读增量
 let appLogOffset = 0;

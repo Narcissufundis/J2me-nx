@@ -95,12 +95,31 @@ for (const d of DIRS) {
   walk(src, d);
 }
 // 仓库根的"源码级"文件
-for (const f of ['package.json', 'README.md', 'PERF-修复记录-perfA-perfB.md']) {
+// icon.jpg 是 `npm run nro` / `npm run nsp` 打包图标时读的输入（@nx.js/* 固定读根目录这个名字），
+// 没有它就只能用 nx.js 自带的默认图标 —— 所以属于"能重建"的源码资产，要进包（perfZ35）。
+// ⚠ 内部开发日志 `PERF-修复记录-perfA-perfB.md` **不进包**（2026-09-24 决定）：
+//   它是中文内部日记，含本机绝对路径/玩家日志路径与大量"待办/下一步"语气，
+//   不适合作为面向第三方的公开文档（公开面只留 README/BUILD/RUNTIME/NOTICE/LICENSE/FORWARDER）。
+for (const f of ['package.json', 'README.md', 'icon.jpg']) {
   const src = path.join(ROOT, f);
   if (fs.existsSync(src)) { fs.copyFileSync(src, path.join(DST, f)); copied++; }
 }
+// PATCH(perfZ44)：CI 也是源码的一部分（外部评审指出"有回归测试却没有 CI"）。
+// .github/ 不在 DIRS 里（不想递归整棵树），这里显式带上 workflow。
+{
+  const wfDir = path.join(ROOT, '.github', 'workflows');
+  if (fs.existsSync(wfDir)) {
+    fs.mkdirSync(path.join(DST, '.github', 'workflows'), { recursive: true });
+    for (const f of fs.readdirSync(wfDir)) {
+      fs.copyFileSync(path.join(wfDir, f), path.join(DST, '.github', 'workflows', f));
+      copied++;
+    }
+  }
+}
 // 文档模板（放在 release/ 里统一维护 —— 这里只做覆盖式复制）
-const TEMPLATES = ['README.md', 'BUILD.md', 'NOTICE.md', 'LICENSE.md', '.gitignore', 'assets-README.md'];
+// FORWARDER.md（perfZ35）：NRO→NSP 前端的安装说明（中英双语），跟前端 NSP 一起发。
+// RUNTIME.md（perfZ49）：nx.js 运行时 JIT 补丁的说明（为什么需要、改了什么、怎么自查与自建）。
+const TEMPLATES = ['README.md', 'BUILD.md', 'RUNTIME.md', 'NOTICE.md', 'LICENSE.md', '.gitignore', 'assets-README.md', 'FORWARDER.md'];
 let tmpl = 0;
 for (const t of TEMPLATES) {
   const src = path.join(ROOT, 'release', t);

@@ -103,6 +103,25 @@ module J2ME {
   }
 
   Native["java/lang/Thread.sleep.(J)V"] = function(addr: number, delayL: number, delayH: number) {
+    // PATCH(perfZ38)：**长睡眠记账**。轩辕剑那次主线程被堵 1111.4s 后自己"恢复"，
+    // 现场里既没有 VM 采样也没有 rAF —— 长 sleep 是能造成这种形态的候选之一
+    // （VM 里所有 Java 线程都在睡时，宿主侧就只剩这一条"睡多久"的线索）。
+    // 只记 >30s 的，且每个量级只报一次，避免刷屏。
+    try {
+      var delayMs = longToNumber(delayL, delayH);
+      if (delayMs > 30000) {
+        var g = (typeof jsGlobal !== "undefined") ? jsGlobal : null;
+        if (g && g.__sdMark) {
+          var bucket = Math.round(delayMs / 60000);
+          g.__sleepReported = g.__sleepReported || {};
+          if (!g.__sleepReported[bucket]) {
+            g.__sleepReported[bucket] = true;
+            g.__sdMark("[sleep] Java 线程请求 sleep " + Math.round(delayMs / 1000) + "s" +
+              "（≈" + bucket + " 分钟）—— 这段时间整个模拟器界面会是静止的");
+          }
+        }
+      }
+    } catch (eSl) { /* 记账不影响睡眠本身 */ }
     asyncImpl(Kind.Void, new Promise(function(resolve, reject) {
       window.setTimeout(resolve, longToNumber(delayL, delayH));
     }));
