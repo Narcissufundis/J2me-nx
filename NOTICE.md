@@ -1,10 +1,5 @@
 # 第三方组件与未随包分发的资产 / Third-party components and non-bundled assets
 
-> 这份文件是**给发布者看的合规清单**：哪些东西是别人的、什么许可证、哪些资产故意没进包、
-> 以及上线前建议处理的事项。请连同 `README.md` / `BUILD.md` 一起保留。
-> This file is the compliance checklist for whoever publishes this repository: what belongs to
-> others, under which license, which assets are deliberately not included, and what to fix
-> before going public. Keep it together with `README.md` / `BUILD.md`.
 
 ---
 
@@ -54,19 +49,7 @@
 
 ---
 
-## 4. 上线前建议处理（待办）/ Suggested TODOs before publishing
 
-1. **`java/prebuilt-classes/**` 的源码**：这些 class 从 phoneME 取来但没有随仓库带源码。
-   GPL 要求分发二进制时提供对应源码 —— 建议从 phoneME 仓库取回对应 `.java` 放进 `java/custom/`
-   并从源码编译（可以顺手让 `tools/build-classes.mjs` 的注入步骤变成可选）。
-   Source for `java/prebuilt-classes/**`: these classes came from phoneME without their sources.
-   Since GPL requires corresponding source for distributed binaries, fetch the upstream `.java`
-   files into `java/custom/` and compile them from source.
-2. **`data/mask.raw` 的图片出处**：确认可再分发，或换一张自制图（1280×720 RGBA 裸数据）。
-   Confirm the provenance of the default mask image, or replace it with your own
-   (1280×720 raw RGBA).
-3. **`release/` 下的文档模板**：改完记得重跑 `node tools/make-publish.mjs` 覆盖到发布目录。
-   If you edit the templates in `release/`, re-run `node tools/make-publish.mjs`.
 4. **开发日志**：`PERF-修复记录-perfA-perfB.md`（中文，记录了每一处补丁的原因与实测数据）
    默认会随快照复制；如果不希望公开，从 `tools/make-publish.mjs` 的根文件清单里去掉它。
    The development log (Chinese) is copied into the snapshot by default; remove it from the
