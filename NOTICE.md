@@ -49,8 +49,3 @@
 
 ---
 
-
-4. **开发日志**：`PERF-修复记录-perfA-perfB.md`（中文，记录了每一处补丁的原因与实测数据）
-   默认会随快照复制；如果不希望公开，从 `tools/make-publish.mjs` 的根文件清单里去掉它。
-   The development log (Chinese) is copied into the snapshot by default; remove it from the
-   file list in `tools/make-publish.mjs` if you don't want it public.
