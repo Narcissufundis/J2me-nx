@@ -1,0 +1,66 @@
+# 构建产物 / Build products
+bld/
+romfs/
+dist/
+java/build/
+java/build-src/
+java/classes.jar
+java/build-srcs.txt
+tools/node_modules/
+node_modules/
+
+# 运行时状态与日志 / runtime state and logs
+*.log
+error.log
+data/error.log
+data/error-old.log
+data/save/
+data/names.txt
+data/keys.txt
+data/keyprofiles.json
+data/lang.json
+data/mask.json
+data/resolutions.json
+data/idb-fs.json
+data/midlet.jar
+data/midlet.jad
+data/*.bak
+data/_adlmidi.core.test.mjs
+
+# 第三方 / 不可再分发资产（见 NOTICE.md）
+data/fonts/*.ttf
+data/fonts/*.otf
+data/adlmidi/*.wasm
+
+# 测试与调试的临时目录 / test scratch dirs
+tools/tmp-*/
+tools/.verify-jar/
+tools/_adlmidi.core.test.mjs
+tools/fixture/*.class
+tools/fixture/fixture.jar
+tools/skip-test/*.class
+tools/skip-test/big.bin
+tools/skip-test/skiptest.jar
+tools/encoding-test/*.class
+tools/encoding-test/enctest.jar
+tools/samsung-test/*.class
+tools/samsung-test/samsungtest.jar
+tools/i18n-test/*
+tools/textinput-test/*.class
+tools/nokia-test/*.class
+
+# 游戏（版权属于厂商）/ games (copyrighted)
+*.jar
+!tools/**/*.jar
+*.jad
+tmp-games/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 发布快照的复核清单 / publish snapshot audit list
+_publish-excluded.txt

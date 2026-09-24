@@ -1,0 +1,43 @@
+# 组装快照时**未**进包的东西（由 tools/make-publish.mjs 打印，供复核）
+data/adlmidi/libadlmidi.full.core.wasm（按名排除）
+data/error.log（后缀 .log）
+data/fonts/cjk.ttf（按名排除）
+data/idb-fs.json（按名排除）
+data/java/classes.jar（按名排除）
+data/keys.txt（按名排除）
+data/midlet.jad.bak（后缀 .bak）
+data/midlet.jad（后缀 .jad）
+data/midlet.jar.bak（后缀 .bak）
+data/midlet.jar（按名排除）
+data/names.txt（按名排除）
+data/resolutions.json（按名排除）
+java/classes.jar（按名排除）
+java/java/io/InputStream.class（.class（编译产物））
+java/tools/Jpp.class（.class（编译产物））
+java/verify-re/com/sun/midp/main/MIDletSuiteLoader.class（.class（编译产物））
+java/vm/com/sun/cldchi/io/ConsoleOutputStream.class（.class（编译产物））
+java/vm/com/sun/cldchi/io/ResourceInputStream.class（.class（编译产物））
+tools/encoding-test/EncTest$MainCanvas.class（.class（编译产物））
+tools/encoding-test/EncTest.class（.class（编译产物））
+tools/fixture/FixtureMidlet$FixtureCanvas.class（.class（编译产物））
+tools/fixture/FixtureMidlet.class（.class（编译产物））
+tools/nokia-test/DgTest$1.class（.class（编译产物））
+tools/nokia-test/DgTest$C.class（.class（编译产物））
+tools/nokia-test/DgTest.class（.class（编译产物））
+tools/samsung-test/SamsungTest$MainCanvas.class（.class（编译产物））
+tools/samsung-test/SamsungTest.class（.class（编译产物））
+tools/skip-test/SkipTest$MainCanvas.class（.class（编译产物））
+tools/skip-test/SkipTest.class（.class（编译产物））
+tools/skip-test/big.bin（按名排除）
+tools/textinput-test/TextOkTest$1.class（.class（编译产物））
+tools/textinput-test/TextOkTest$MainCanvas.class（.class（编译产物））
+tools/textinput-test/TextOkTest.class（.class（编译产物））
+tools/textinput-test/TextTest$1.class（.class（编译产物））
+tools/textinput-test/TextTest.class（.class（编译产物））
+目录 data/masks
+目录 data/save
+目录 java/build
+目录 tools/i18n-test/build
+目录 tools/node_modules
+目录 tools/tmp-ratchet
+目录 tools/tmp-softrestart
