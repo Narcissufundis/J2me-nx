@@ -255,8 +255,8 @@ When reporting issues, please attach `sdmc:/switch/j2me-nx/error.log` (and `sdmc
   VM: [PluotSorbet](https://github.com/mozilla/pluotsorbet) (Mozilla); class libraries derived from phoneME (Sun/Oracle).
 - 运行时：[nx.js](https://github.com/TooTallNate/nx.js)（TooTallNate）及其 JIT 内存补丁。
   Runtime: [nx.js](https://github.com/TooTallNate/nx.js) (TooTallNate) plus the JIT memory patch.
-- 本移植的补丁与宿主层：作者 Narcissufundis。
-  Port patches and host layer: Narcissufundis.
+- 本移植的补丁：[zixing131](https://github.com/zixing131)。
+  Port patches : [zixing131](https://github.com/zixing131).
 - 第三方组件、许可证与**未随包分发**的资产清单见 `NOTICE.md`。
   Third-party components, licenses, and assets **not** bundled here: see `NOTICE.md`.
 - 本项目按 **GPL-2.0-or-later** 发布（见 `LICENSE.md`）。
