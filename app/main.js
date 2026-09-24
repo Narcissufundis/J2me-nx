@@ -1542,7 +1542,7 @@
       });
     } catch (e) { /* 忽略 */ }
   })();
-  sdLog('[boot] 入口加载，平台=' + (IS_SWITCH ? 'Switch' : (IS_NODE ? 'Node' : '未知')) + '，build=20260924-perfZ24-trapfix');
+  sdLog('[boot] 入口加载，平台=' + (IS_SWITCH ? 'Switch' : (IS_NODE ? 'Node' : '未知')) + '，build=20260924-perfZ25-ofont');
 
   // romfs 挂载诊断：两条读取路径各探测一次，结果落日志
   if (IS_SWITCH) {
@@ -1559,9 +1559,89 @@
     // fetch 内部可能走 libuv 线程池（beta.6 有 worker condvar 崩溃），不再使用。
   }
 
+  // ==================================================================
+  // 1.4 耗时账本（PATCH perfZ25）
+  // ==================================================================
+  // 背景：玩家实测"游戏刚进入卡几秒"，但 [present] 的 vm/gfx/aud/other 四笔账
+  // 里 other 混进了 vsync 空转（300 帧/5.0s = 满帧时 other 必然 ≈4.4s），
+  // 所以那四笔账定位不到入口卡顿。入口成本实际发生在宿主层：读盘、zip 解压、
+  // PNG 解码、呈现合成——本账本按入口逐笔记 {次数, 毫秒, 字节}，每 10s 落一条
+  // [cost]，把"卡几秒"直接摊到具体环节上。
+  // 记账点：宿主读盘（本文件）、zip inflate（vendor/pluotsorbet/libs/zipfile.js）、
+  // PNG 解码（src/host/env-prelude.js 原生/JS 两条路）、屏幕呈现（本文件）。
+  function costBook() {
+    if (!g.__cost) g.__cost = Object.create(null);
+    return g.__cost;
+  }
+  function costAdd(name, ms, bytes) {
+    var book = costBook();
+    var b = book[name] || (book[name] = { n: 0, ms: 0, bytes: 0 });
+    b.n++;
+    b.ms += ms;
+    if (bytes) b.bytes += bytes;
+  }
+  g.__costAdd = costAdd; // vendor/宿主其它脚本共用（都自带 typeof 守卫）
+
+  // 读一条账并清零（窗口语义，与 [alloc] 探针一致）
+  function costTake(name) {
+    var book = costBook();
+    var b = book[name];
+    book[name] = { n: 0, ms: 0, bytes: 0 };
+    return b || { n: 0, ms: 0, bytes: 0 };
+  }
+  function costText(name) {
+    var b = costTake(name);
+    return name + '=' + b.n + '次/' + (b.ms / 1000).toFixed(2) + 's' +
+      (b.bytes ? '/' + (b.bytes / 1048576).toFixed(2) + 'MB' : '');
+  }
+  function costAllText() {
+    return costText('读盘') + ' ' + costText('解压') + ' ' +
+      costText('原生解码') + ' ' + costText('JS解码');
+  }
+
+  // ---- 入口时间轴（PATCH perfZ25）----
+  // 玩家口径的"游戏刚进入卡几秒"必须能摊开：选中 → jar 读入 → 入库 →
+  // isolate 启动 → isolate 返回 → 首帧。每笔落一条 [enter]，首帧时汇总。
+  // 累计账（读盘/解压/解码）也在汇总里给出，用于回答"几秒花在哪个环节"。
+  function enterMark(name) {
+    var t = g.__enterT;
+    if (!t) t = g.__enterT = { marks: [], t0: Date.now() };
+    t.marks.push([name, Date.now()]);
+  }
+  g.__enterMark = enterMark;
+  function enterNewGame() {
+    g.__enterT = { marks: [], t0: Date.now() };
+    costBook(); // 不清零：本次开机累计（含菜单/上一个游戏）也一并给出，便于对比
+    // 兜底：20s 还没出首帧（游戏起不来/卡死）也要留下时间轴，别只有黑屏
+    if (g.__enterWatchdog) clearTimeout(g.__enterWatchdog);
+    g.__enterWatchdog = setTimeout(function () {
+      if (g.__enterT) enterSummary('入口账本（20s 未出首帧）');
+    }, 20000);
+  }
+  function enterSummary(tag) {
+    var t = g.__enterT;
+    if (g.__enterWatchdog) { clearTimeout(g.__enterWatchdog); g.__enterWatchdog = null; }
+    if (!t || !t.marks.length) return;
+    var parts = [], prev = null;
+    for (var i = 0; i < t.marks.length; i++) {
+      var nm = t.marks[i][0], ts = t.marks[i][1];
+      parts.push(nm + (prev === null ? '=0' : '=' + (ts - prev)) + 'ms');
+      prev = ts;
+    }
+    sdLog('[enter] ' + tag + '（自选中累计 ' + ((Date.now() - t.t0) / 1000).toFixed(1) + 's）: ' +
+      parts.join(' → ') + ' | 累计 ' + costAllText());
+    if (typeof __logFlush === 'function') __logFlush();
+    g.__enterT = null; // 只汇总一次
+  }
+
   function readFileBytes(path) {
     // 返回 Promise<Uint8Array>；失败时包装路径信息（实机日志定位用）
-    return _readFileBytesImpl(path).catch(function (e) {
+    var t0 = Date.now();
+    return _readFileBytesImpl(path).then(function (bytes) {
+      costAdd('读盘', Date.now() - t0, bytes ? bytes.byteLength : 0);
+      return bytes;
+    }, function (e) {
+      costAdd('读盘', Date.now() - t0, 0);
       var msg = (e && e.message) ? e.message : String(e);
       throw new Error('readFileBytes 失败: ' + path + ' — ' + msg);
     });
@@ -1653,7 +1733,8 @@
   }
 
   // CJK 字体：nx.js canvas 内置字体（Geist Mono/system-ui）无汉字字形，
-  // 中文 J2ME 游戏 drawString 会全是 .notdef 口框。从 romfs 读 SimHei 注册为
+  // 中文 J2ME 游戏 drawString 会全是 .notdef 口框。从 romfs 读内置 CJK 字体
+  // （Noto Sans SC，SIL OFL 1.1，允许再分发；见 data/fonts/README.md）注册为
   // FontFace 家族 "j2mecjk"。注册配方与 mv2switch 实机验证过的一致：
   //   fonts.add(new FontFace(family, 纯ArrayBuffer))  —— add 即生效；
   //   face.load() 在本运行时是空壳（Method not implemented），仅记录不作为判据。
@@ -1662,7 +1743,7 @@
   function installCjkFont() {
     if (!IS_SWITCH) return Promise.resolve(false);
     // 跨会话缓存：g.fonts/g 是宿主常驻对象，字体注册一次终身有效。
-    // 软重启重读 9.7MB ttf 再 add 一个同族 FontFace，纯粹浪费内存
+    // 软重启重读 10.6MB ttf 再 add 一个同族 FontFace，纯粹浪费内存
     //（旧 typeface 要等 GC，Skia 侧 native 内存不计入 V8 预算）。
     if (g.__j2meCjkFontOK) return Promise.resolve(true);
     sdLog('[font] FontFace=' + typeof g.FontFace + ' fonts=' + typeof g.fonts);
@@ -1771,7 +1852,7 @@
         ' 拉丁"A"真实=' + looksReal('20px "system-ui"', 'A', tofu));
       sdLog('[font-probe] j2mecjk 汉字"测"真实=' + looksReal('20px "j2mecjk"', '\u6D4B', tofu) +
         ' 默认monospace 汉字真实=' + looksReal('20px monospace', '\u6D4B', tofu));
-      // 缺字定位：GBK 生僻字组（"堃喆镕"），SimHei 全有 = 注册生效但渲染没用它
+      // 缺字定位：GBK 生僻字组（"堃喆镕"），内置字体全有 = 注册生效但渲染没用它
       var rare = ['\u5803', '\u5586', '\u9555']; // 堃 喆 镕
       var j2meRare = rare.map(function (ch) { return looksReal('20px "j2mecjk"', ch, tofu) ? 1 : 0; }).join('');
       var sysRare = rare.map(function (ch) { return looksReal('20px "system-ui"', ch, tofu) ? 1 : 0; }).join('');
@@ -1783,7 +1864,7 @@
         return looksReal('bold 19px "j2mecjk"', ch, tofu) ? 1 : 0;
       }).join('');
       sdLog('[font-probe] bold19px 汉字"测"=' + boldOK + ' 载戏键帮=' + boldRare +
-        '（1111=bold 全走 SimHei，修复生效）');
+        '（1111=bold 全走内置 CJK 字体，修复生效）');
       sdLog('[font-probe] 判定: j2mecjk 汉字真实=' + looksReal('20px "j2mecjk"', '\u6D4B', tofu) +
         '（true=字体注册渲染全通；false=仍会缺字，需查注册链路）');
     } catch (e) {
@@ -1851,7 +1932,12 @@
             ' text="' + str.slice(0, 40).replace(/\n/g, '\\n') + '"' +
             (tofu.length ? ' 豆腐块=' + tofu.join('') : '') +
             (blank.length ? ' 空白=' + blank.join('') : ''));
-          if (calls === 1 && typeof __logFlush === 'function') __logFlush();
+          if (calls === 1) {
+            // PATCH(perfZ25)：首次文字绘制 = 游戏 UI 真正出现的时点，记进入口账本
+            // （黑屏期的结束点；首帧可能只是全黑，文字才说明游戏开始画界面）
+            try { enterMark('首次文字'); } catch (eEM) { /* 忽略 */ }
+            if (typeof __logFlush === 'function') __logFlush();
+          }
         } catch (e) { /* 忽略 */ }
       };
       sdLog('[text-spy] 已安装');
@@ -1989,9 +2075,12 @@
       if (path === 'midlet.jar') {
         sdLog('[res] midlet.jar → 等待菜单选择 ...');
         return g.__gameSelection.then(function (sel) {
+          enterNewGame();
+          enterMark('选中jar');
           sdLog('[res] midlet.jar = ' + sel.file + '（' + sel.name + '）');
           return readFileBytes(sel.absPath);
         }).then(function (bytes) {
+          enterMark('读入完成');
           sdLog('[res] 选中游戏读入 ' + bytes.byteLength + 'B');
           return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
         });
@@ -2057,12 +2146,21 @@
   }
 
   // nx.js 的 drawImage 只接受原生 CanvasImageSource；PNG 解码产物是纯像素
-  // 数据（伪 Image）。包装 ctx.drawImage：遇到伪 Image 转 putImageData。
+  // 数据（伪 Image）。包装 ctx.drawImage：
+  //   · 伪 Image 带 _bitmap（runtime 原生 ImageBitmap）→ 直接进原生 drawImage
+  //     （Skia 路径，无需 putImageData 主线程拷贝，见 perfZ25 原生解码）
+  //   · 伪 Image 带 _decoded（纯 JS 解码的像素）→ putImageData 回落
   function wrapNxContext(canvas) {
     var ctx = canvas.getContext('2d');
     if (!ctx || ctx.__j2meWrapped) return;
     var rawDrawImage = ctx.drawImage.bind(ctx);
     ctx.drawImage = function (img, a, b, c, d, e, f, gg, hh) {
+      if (img && img._bitmap) {
+        var src = img._bitmap;
+        if (arguments.length === 3) return rawDrawImage(src, a, b);
+        if (arguments.length === 5) return rawDrawImage(src, a, b, c, d);
+        return rawDrawImage(src, a, b, c, d, e, f, gg, hh);
+      }
       if (img && img._decoded) {
         var png = img._decoded;
         var clamped = new Uint8ClampedArray(png.data);
@@ -2135,6 +2233,13 @@
 
     var __frames = 0;
     var lastScr = null, liveCtx = null; // screen 换了才重取 context
+    // PATCH(perfZ25)：合成缓冲（离屏 scene）+ 呈现耗时明细。
+    // 实测背景：other 那笔账里混着 vsync 空转（满帧时它必然 ≈窗口长度），
+    // 所以呈现到底花多少毫秒只能自己记。清屏/游戏/遮罩/上屏四段分开累计，
+    // 每 300 帧随 [present] 一起落盘 —— 由此判断呈现层是不是卡顿元凶。
+    var scene = null, sceneCtx = null, sceneW = 0, sceneH = 0;
+    var presAcc = 0, presMax = 0, presMiss = 0;
+    var clearMsAcc = 0, gameMsAcc = 0, blitMsAcc = 0;
     function present() {
       // 循环常驻：fatal 画面显示中 / 菜单阶段 / 软重启间隙都只跳过绘制、
       // 继续排 rAF。旧版在 fatal 时直接 return 杀死 rAF 链——一次致命错误
@@ -2155,6 +2260,8 @@
       if (__frames === 1) {
         // 首帧探针：放行后游戏真正绘出第一画面的时点（逐条立即落盘）
         sdLog('[game] 首帧已绘（呈现层收到第一幅游戏画面）');
+        // PATCH(perfZ25)：入口账本收口 —— 选中→读入→入库→isolate→首帧 每段毫秒
+        try { enterMark('首帧'); enterSummary('入口账本'); } catch (eEnt) { /* 账本故障不影响游戏 */ }
         if (typeof __logFlush === 'function') __logFlush();
         // perfF/perfI：崩溃面包屑。实机现象是"模拟器自己退出、无报错、无 crash_reports"
         // （= runtime 的 V8 fatal 路径 clean exit），10s 心跳太稀，最后 10s 是黑的。
@@ -2213,7 +2320,8 @@
       }
       if (__frames % 300 === 1) {
         // 帧时间三分账：解释器(vm) / LCDUI 原语(gfx) / 音频渲染(aud)，
-        // 其余 = 编译后 Java 代码 + 事件泵 + 本函数绘制。窗口 300 帧。
+        // ⚠️ other 包含 vsync 空转：满帧时（300 帧/5.0s）窗口里必然有 ≈4.4s 是
+        // 等垂直同步，不能当成"别处耗时"。真实呈现成本看下面的"呈现="。
         var nowMs = Date.now();
         var winMs = nowMs - (g.__lastSplitMs || nowMs);
         g.__lastSplitMs = nowMs;
@@ -2221,12 +2329,21 @@
         var gfxMs = g.__gfxMsAcc || 0; g.__gfxMsAcc = 0;
         var audMs = g.__audMsAcc || 0; g.__audMsAcc = 0;
         var otherMs = Math.max(0, winMs - vmMs - gfxMs - audMs);
+        var nWin = Math.max(1, Math.min(__frames - 1, 300)); // 首帧那次窗口不到 300 帧
+        var pAvg = presAcc / nWin;
         sdLog('[present] 帧 ' + __frames + ' 画布=' + dw + 'x' + dh +
           (dw > dh ? ' 横屏铺满' : ' 竖屏遮罩') +
           ' | 窗口' + (winMs / 1000).toFixed(1) + 's: vm=' + (vmMs / 1000).toFixed(1) +
           's gfx=' + (gfxMs / 1000).toFixed(1) +
           's aud=' + (audMs / 1000).toFixed(1) +
-          's other=' + (otherMs / 1000).toFixed(1) + 's');
+          's other=' + (otherMs / 1000).toFixed(1) + 's' +
+          ' | 呈现=' + pAvg.toFixed(1) + 'ms/帧(峰' + presMax + 'ms >20ms帧=' + presMiss +
+          ') 清=' + (clearMsAcc / nWin).toFixed(1) + ' 游戏=' + (gameMsAcc / nWin).toFixed(1) +
+          ' 上屏=' + (blitMsAcc / nWin).toFixed(1) +
+          ' | 真空闲=' + ((winMs - vmMs - gfxMs - audMs - presAcc) / 1000).toFixed(1) + 's ' +
+          costAllText());
+        presAcc = 0; presMax = 0; presMiss = 0;
+        clearMsAcc = 0; gameMsAcc = 0; blitMsAcc = 0;
       }
       if (dw > 0 && dh > 0 && sw > 0 && sh > 0) {
         var scale, cw, ch, cx, cy;
@@ -2270,20 +2387,64 @@
           cw = dw * scale; ch = dh * scale;
           cx = GX + (GW - cw) / 2; cy = GY + (GH - ch) / 2;
         }
-        sctx.imageSmoothingEnabled = false; // 像素风硬边放大（防文字发糊）
-        sctx.fillStyle = '#000';
-        sctx.fillRect(0, 0, sw, sh);
+        var tClear = Date.now();
+        // PATCH(perfZ25)：合成缓冲 + 一次上屏。
+        // 旧写法是往可见的 screen 画布上依次 fillRect/game/mask —— 每次调用都是
+        // 一次可见表面写入，实机上表现为偶发半帧（清屏后的黑屏一闪、或遮罩还没
+        // 盖上去的裸画面），也就是玩家报的"黑屏闪屏"。现在全部先画进离屏
+        // scene，最后只做一次整屏 1:1 拷贝：可见表面每帧只被写一次 = 原子。
+        if (!scene || sceneW !== sw || sceneH !== sh) {
+          try {
+            scene = new g.OffscreenCanvas(sw, sh);
+            sceneCtx = scene.getContext('2d');
+            sceneW = sw; sceneH = sh;
+            sdLog('[present] 合成缓冲 ' + sw + 'x' + sh + '（单次上屏，防半帧闪屏）');
+          } catch (eScene) {
+            scene = null; sceneCtx = null;
+            sdLog('[present] 合成缓冲创建失败，回落直画屏幕: ' + (eScene && eScene.message));
+          }
+        }
+        var octx = sceneCtx || sctx; // 无离屏时退化为旧行为
+        try {
+        octx.imageSmoothingEnabled = false; // 像素风硬边放大（防文字发糊）
+        octx.fillStyle = '#000';
+        octx.fillRect(0, 0, sw, sh);
+        var tGame0 = Date.now();
+        clearMsAcc += tGame0 - tClear;
         if (useMask) {
           // 自选遮罩：垫底铺满，游戏画在上面（装饰贴边、游戏居中盖住窗口区）
-          sctx.drawImage(useMask, 0, 0, sw, sh);
-          sctx.drawImage(displayCanvas, cx, cy, cw, ch);
+          octx.drawImage(useMask, 0, 0, sw, sh);
+          octx.drawImage(displayCanvas, cx, cy, cw, ch);
         } else {
           // 默认：竖屏游戏画进内置遮罩白区后遮罩盖在上（旧行为）；横屏纯铺满
-          sctx.drawImage(displayCanvas, cx, cy, cw, ch);
-          if (maskCanvas && dw <= dh) sctx.drawImage(maskCanvas, 0, 0, sw, sh);
+          octx.drawImage(displayCanvas, cx, cy, cw, ch);
+          if (maskCanvas && dw <= dh) octx.drawImage(maskCanvas, 0, 0, sw, sh);
         }
-        // 文本输入时叠加内置软键盘（左右贴边，中间留出游戏画面）
-        if (kbState && kbState.active) drawKbOverlay(sctx, sw, sh);
+        var tBlit0 = Date.now();
+        gameMsAcc += tBlit0 - tGame0;
+        if (sceneCtx) sctx.drawImage(scene, 0, 0); // 唯一的可见表面写入
+        var tEnd = Date.now();
+        blitMsAcc += tEnd - tBlit0;
+        var presMs = tEnd - tClear;
+        presAcc += presMs;
+        if (presMs > presMax) presMax = presMs;
+        if (presMs > 20) presMiss++; // 20ms = 掉到 50fps 以下（一帧预算 16.7ms）
+        costAdd('呈现', presMs, 0);
+        // 文本输入时叠加内置软键盘（左右两侧留出游戏画面；键盘本身是静态覆盖层）
+        if (kbState && kbState.active) {
+          sctx.imageSmoothingEnabled = false;
+          drawKbOverlay(sctx, sw, sh);
+        }
+        } catch (eDraw) {
+          // PATCH(perfZ25)：呈现层**绝不能**因一次绘制异常就断掉 rAF 链
+          // （历史事故：fatal 时 return 杀掉 rAF → 之后所有游戏都停在上个画面）。
+          // 离屏合成是新引入的失败点（画布被回收/尺寸异常），异常时丢掉它并回落直画。
+          if (!g.__presentDrawErr) {
+            g.__presentDrawErr = true;
+            try { sdLog('[present] 绘制异常（只报一次，已丢掉合成缓冲回落直画）: ' + (eDraw && eDraw.message)); } catch (eP2) { /* 忽略 */ }
+          }
+          scene = null; sceneCtx = null; sceneW = 0; sceneH = 0;
+        }
       }
       g.__noGen.requestAnimationFrame(present);
     }
@@ -4353,6 +4514,10 @@
               if (hs) sdLog('[alloc] 卡顿现场: ' + JSON.stringify(hs));
             }
           } catch (ape) { /* 探针倾倒故障不干扰游戏 */ }
+          // PATCH(perfZ25)：耗时账本 —— 读盘/解压/解码窗口汇总。
+          // 与 [present] 的 vm/gfx/aud 互补：那三笔只覆盖 VM 内部，入口卡顿几乎
+          // 全发生在这几笔宿主账上（jar 读盘、zip 解压、PNG 解码）。
+          try { sdLog('[cost] ' + costAllText()); } catch (eCost) { /* 忽略 */ }
           // 调试钩子（gc 冻结复现）：宿主侧请求强制 GC（走与 System.gc 相同路径）
           try {
             if (typeof globalThis !== 'undefined' && !globalThis.__forceGCRequest) {

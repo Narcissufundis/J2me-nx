@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /*
  * make-publish.mjs — 组装"可公开的源码快照"（perfZ24）
  *
@@ -44,7 +44,9 @@ const SKIP_NAMES = new Set([
   'error.log', 'names.txt', 'keys.txt', 'keyprofiles.json', 'lang.json', 'mask.json',
   'resolutions.json', 'idb-fs.json',
   'nxjs-debug.log',     // 运行期状态
-  'cjk.ttf',            // 第三方字体（SimHei）→ 见 NOTICE.md，请自备
+  // PATCH(perfZ25)：cjk.ttf **不再排除**。内置字体已从不可再分发的 SimHei 换成
+  // SIL OFL 1.1 的 Noto Sans SC（fsType=0，允许再分发），随包带上开箱即可构建；
+  // 许可证 data/fonts/OFL-NotoSansSC.txt（打包后 romfs 的 fonts/OFL.txt）同在包里。
   'libadlmidi.full.core.wasm', // 第三方 wasm（默认 wasm=off，用不到）
   // ⛔ 商业游戏 jar：测试夹具已换成自制的 tools/fixture/fixture.jar；data/midlet.jar 是
   //    仿真期把游戏拷进 data/ 的中间产物。都不许进公开仓库。

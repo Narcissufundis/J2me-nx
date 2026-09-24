@@ -68,7 +68,21 @@ copy('data/java/classes.jar', 'java/classes.jar');
 }
 copy('data/certs/_main.ks', 'certs/_main.ks');
 
-console.log('[package] CJK 字体（SimHei，实机 canvas 无内置汉字字形）...');copy('data/fonts/cjk.ttf', 'fonts/cjk.ttf');
+// PATCH(perfZ25)：内置 CJK 字体换成 **Noto Sans SC（SIL OFL 1.1，可再分发）**。
+// 旧的内置字体是 SimHei（fsType=8 = 仅允许嵌入，不允许再分发），发布到 Git 有
+// 版权问题；新字体是从 google/fonts 的 NotoSansSC[wght].ttf 用 fontTools 实例化
+// 出来的静态 Regular（31,036 字形，覆盖 GBK 生僻字），族名仍是 Noto Sans SC
+// （OFL 保留字是 'Source'，未使用）。许可证随字体一起进 romfs，见 data/fonts/。
+console.log('[package] CJK 字体（Noto Sans SC，SIL OFL 1.1，实机 canvas 无内置汉字字形）...');
+copy('data/fonts/cjk.ttf', 'fonts/cjk.ttf');
+{
+  const licSrc = join(root, 'data', 'fonts', 'OFL-NotoSansSC.txt');
+  if (existsSync(licSrc)) {
+    copy('data/fonts/OFL-NotoSansSC.txt', 'fonts/OFL.txt');
+  } else {
+    console.log('  ⚠ 缺少 data/fonts/OFL-NotoSansSC.txt（OFL 要求随字体分发许可证）');
+  }
+}
 // 内置遮罩（2026-09-23 perfZ6）：**只有 raw，没有 png**。
 // mask.raw = 默认遮罩（复古诺基亚，1280x720 RGBA 裸数据）；masks/*.raw = 8 张可选项。
 // 以前这里还拷一份 data/mask.png 作兜底，实机跑 PNG 解码是大分配/秒退的嫌疑源

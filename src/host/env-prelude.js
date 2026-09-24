@@ -432,6 +432,64 @@
   // Image
   // ------------------------------------------------------------------
 
+  // PATCH(perfZ25)：抓取 runtime 的原生图像解码能力（libpng + 线程池）。
+  // nx.js 的 createImageBitmap(Blob) → $.imageDecode → source/image.cc 里的
+  // decode_png（C 实现，跑在 libuv worker 线程上）。用它替换我们纯 JS 的
+  // PNG 解码器有两个收益：
+  //   ① 解码不再占主线程 —— 游戏读图期间呈现层/按键/rAF 照常跑（黑屏闪屏的
+  //      直接来源就是主线程被 JS 解码堵死）；
+  //   ② 纯 JS inflate+反滤波 ≈ 每张图几十毫秒，原生快一个数量级（实测入口
+  //      十秒级卡顿的主因之一）。
+  // ⚠️ 必须在 g.Blob = 我们自己的 Blob 之前存引用：createImageBitmap 内部用
+  // `image instanceof Blob`（runtime 的 Blob 类）判断，我们的 Blob 冒充不了。
+  // 软重启会重跑本文件，那时 g.Blob 已经是我们的 shim → 用 __j2meBlobShim 标记
+  // 认出它，并且只在第一次抓到真类时写入跨会话全局（全局在软重启间是保留的）。
+  var nativeBlobClass = g.__nativeBlobClass || null;
+  if (!nativeBlobClass && typeof g.Blob === 'function' && !g.Blob.__j2meBlobShim) {
+    nativeBlobClass = g.Blob;
+  }
+  var nativeCreateImageBitmap = g.__nativeCreateImageBitmap ||
+    ((typeof g.createImageBitmap === 'function') ? g.createImageBitmap : null);
+  // 解码耗时记账（宿主 [cost] 汇总；g.__costAdd 由 app/main.js 提供，缺席则跳过）
+  function imgCost(name, ms, bytes) {
+    try { if (typeof g.__costAdd === 'function') g.__costAdd(name, ms, bytes || 0); } catch (e) { /* 忽略 */ }
+  }
+
+  // ---- 原生解码的**格式闸门**（PATCH perfZ25，安全关键）----
+  // 读过 runtime 的 source/image.cc 后确认，它的 decode_png 只干这几件事：
+  //   png_set_bgr + png_set_expand（调色板/低位深灰度展开到 8bit、tRNS 展开成 alpha）
+  //   + 非 RGBA 时 png_set_add_alpha(0xff)，然后**只对 colorType==RGBA 预乘 alpha**，
+  //   输出被当作"预乘 BGRA"直接包进 SkImage（canvas.cc）。
+  // 由此有三类 PNG 它处理不了，必须回落我们自己的纯 JS 解码器：
+  //   ① 灰度（colorType 0/4）：没有 png_set_gray_to_rgb，仍是 1~2 字节/像素，
+  //      而行距按 4*width 排 —— 像素会错位成垃圾；
+  //   ② 位深 ≠ 8（尤其 16bit）：每行字节数 > 4*width，libpng 会**写越界**（堆破坏！）；
+  //   ③ 调色板 + tRNS（colorType 3 带 tRNS）：expand 展开出的是**非预乘** alpha，
+  //      而下游按预乘解释 → 透明像素的非零 RGB 会被加进去 = 精灵周围出现彩边/黑边。
+  // 这三类以外（8bit 的 RGB / RGBA / 无 tRNS 调色板）原生路径是可证正确的。
+  function pngHasChunk(bytes, type) {
+    // 在 IDAT 之前扫 4 字节 chunk 类型名。整段扫也够用：误判只会多走一次 JS 解码。
+    var a = type.charCodeAt(0), b = type.charCodeAt(1), c = type.charCodeAt(2), d = type.charCodeAt(3);
+    var n = bytes.length - 3;
+    for (var i = 8; i < n; i++) {
+      if (bytes[i] === a && bytes[i + 1] === b && bytes[i + 2] === c && bytes[i + 3] === d) return true;
+    }
+    return false;
+  }
+  function nativePngSafe(bytes) {
+    // PNG 签名 8 字节 + IHDR：bitDepth = bytes[24]，colorType = bytes[25]
+    if (!bytes || bytes.length < 33) return false;
+    if (bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47) return false;
+    var bitDepth = bytes[24], colorType = bytes[25];
+    if (bitDepth !== 8) return '位深' + bitDepth;
+    if (colorType === 2 || colorType === 6) return true;          // RGB / RGBA（上游会正确预乘）
+    if (colorType === 3) return pngHasChunk(bytes, 'tRNS') ? '调色板+tRNS(非预乘)' : true;
+    return '灰度/其它colorType' + colorType;                        // 0/4
+  }
+  // 因格式回落的原因统计（[cost] 之外再单独看一眼；只报前几条原文）
+  g.__imgFmtSkip = g.__imgFmtSkip || Object.create(null);
+  g.__nativePngSafe = nativePngSafe; // 供 tests/native-png-gate.test.mjs 直接断言判定表
+
   function Image(w, h) {
     this.width = w || 0;
     this.height = h || 0;
@@ -440,9 +498,12 @@
     this.onload = null;
     this.onerror = null;
     this.complete = false;
-    // 解码产物：{ width, height, data(Uint8Array RGBA) }，Switch 端 drawImage
-    // 包装层据此 putImageData（见 app/main.js installCanvas）
+    // 解码产物二选一：
+    //   _bitmap  = runtime 原生 ImageBitmap（首选，drawImage 直接吃）
+    //   _decoded = { width, height, data(Uint8Array RGBA) } 纯 JS 回落
+    // Switch 端 drawImage 包装层两种都认（见 app/main.js installCanvas）。
     this._decoded = null;
+    this._bitmap = null;
   }
   Object.defineProperty(Image.prototype, 'src', {
     set: function (v) {
@@ -450,25 +511,76 @@
       if (typeof v === 'string' && v.slice(0, 5) === 'blob:') {
         // JAR 内 PNG 解码路径：gfx.js 用 Blob+createObjectURL+Image 解码图片
         var bytes = blobUrls[v];
-        setTimeout(function () {
-          if (!bytes || typeof g.__decodePNG !== 'function') {
-            g.console && g.console.warn('[img] PNG 解码前置条件不满足: bytes=' + !!bytes +
-              ' decoder=' + typeof g.__decodePNG);
-            if (self.onerror) self.onerror({ type: 'error' });
-            return;
+
+        // ---- 首选：runtime 原生解码（libuv 线程池里跑 libpng）----
+        function tryNative() {
+          if (!nativeBlobClass || !nativeCreateImageBitmap || !bytes || !bytes.length) return false;
+          var safe = nativePngSafe(bytes);
+          if (safe !== true) {
+            // 格式超出 runtime 解码器的能力（见上面闸门说明）→ 交回纯 JS 解码器
+            var k = String(safe);
+            var st = g.__imgFmtSkip;
+            st[k] = (st[k] || 0) + 1;
+            if (st[k] === 1) {
+              try {
+                g.console && g.console.log('[img] 该格式走纯 JS 解码（原生解码器不支持）: ' + k);
+              } catch (eF) { /* 忽略 */ }
+            }
+            return false;
           }
+          var t0 = Date.now();
+          var blob;
           try {
-            var png = g.__decodePNG(bytes);
-            self._decoded = png;
-            self.width = self.naturalWidth = png.width;
-            self.height = self.naturalHeight = png.height;
+            blob = new nativeBlobClass([bytes], { type: 'image/png' });
+          } catch (eB) { return false; }
+          var p;
+          try { p = nativeCreateImageBitmap(blob); } catch (eC) { return false; }
+          if (!p || typeof p.then !== 'function') return false;
+          p.then(function (bmp) {
+            if (!bmp) throw new Error('空 ImageBitmap');
+            self._bitmap = bmp;
+            self.width = self.naturalWidth = bmp.width;
+            self.height = self.naturalHeight = bmp.height;
             self.complete = true;
+            imgCost('原生解码', Date.now() - t0, bytes.length);
             if (self.onload) self.onload({ type: 'load' });
-          } catch (e) {
-            g.console && g.console.warn('[image] PNG 解码失败: ' + e.message);
-            if (self.onerror) self.onerror({ type: 'error' });
-          }
-        }, 0);
+          }, function (eN) {
+            // 原生失败 → 回落 JS 解码（不静默丢图）
+            try {
+              g.console && g.console.warn('[img] 原生解码失败，回落 JS: ' + (eN && eN.message));
+            } catch (eL) { /* 忽略 */ }
+            jsDecode();
+          });
+          return true;
+        }
+
+        // ---- 回落：纯 JS PNG 解码（Node 仿真 / 原生不可用时）----
+        function jsDecode() {
+          setTimeout(function () {
+            if (!bytes || typeof g.__decodePNG !== 'function') {
+              g.console && g.console.warn('[img] PNG 解码前置条件不满足: bytes=' + !!bytes +
+                ' decoder=' + typeof g.__decodePNG);
+              if (self.onerror) self.onerror({ type: 'error' });
+              return;
+            }
+            var t0 = Date.now();
+            try {
+              var png = g.__decodePNG(bytes);
+              self._decoded = png;
+              self.width = self.naturalWidth = png.width;
+              self.height = self.naturalHeight = png.height;
+              self.complete = true;
+              imgCost('JS解码', Date.now() - t0, bytes.length);
+              if (self.onload) self.onload({ type: 'load' });
+            } catch (e) {
+              g.console && g.console.warn('[image] PNG 解码失败: ' + e.message);
+              if (self.onerror) self.onerror({ type: 'error' });
+            }
+          }, 0);
+        }
+
+        if (tryNative()) return;
+        jsDecode();
         return;
       }
       // 其它（emoji 等资源路径）：延迟触发 onload，保证依赖 onload 的流程不挂死
@@ -493,6 +605,11 @@
     },
     revokeObjectURL: function (id) { delete blobUrls[id]; },
   };
+  g.__nativeBlobClass = nativeBlobClass;
+  g.__nativeCreateImageBitmap = nativeCreateImageBitmap;
+  try {
+    g.console && g.console.log('[img] 原生解码=' + (nativeCreateImageBitmap ? '可用(libpng+线程池)' : '不可用(回落纯JS)'));
+  } catch (eLog) { /* 忽略 */ }
 
   // ------------------------------------------------------------------
   // Blob / FileReader（libs/fs.js、FileSaver 依赖）
@@ -534,6 +651,10 @@
     b.size = b._bytes.length;
     return b;
   };
+  // PATCH(perfZ25)：给我们的 Blob 打标记 —— 软重启时本文件重跑，必须能认出
+  // 全局上的 Blob 已经是我们的 shim（而不是 runtime 的原生类），否则会把 shim
+  // 当原生类抓走，createImageBitmap 会以 "Unsupported image source" 失败。
+  Blob.__j2meBlobShim = true;
   g.Blob = Blob;
 
   function FileReader() {

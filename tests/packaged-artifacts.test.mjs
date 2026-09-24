@@ -63,7 +63,7 @@ for (const p of pairs) {
 const rmRaw = readFileSync(join(root, 'romfs/main.js'), 'utf8');
 const rm = rmRaw.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
 const MARK = {
-  '构建标记 perfZ24': '20260924-perfZ24-trapfix',
+  '构建标记 perfZ25': '20260924-perfZ25-ofont',
   '文本输入钩子': '__hostTextInput',
   '输入法注入钩子': '__sendInputMethodText',
   '按键映射面板入口': 'openKeyMap',
@@ -90,6 +90,14 @@ const MARK = {
   '屏显中/英：右上角双语提示（中文行）': '\u6309 ZR+ZL \u5207\u6362\u4E2D/\u82F1\u6587',
   '屏显中/英：右上角双语提示（英文行）': 'Press ZR+ZL to switch language',
   '屏显中/英：弹窗两项': '\u5207\u6362\u5230\u82F1\u6587',
+  // perfZ25：入口耗时账本 + 原子合成（防"进入游戏卡几秒/黑屏闪屏"回退成不可观测）
+  '入口耗时账本：汇总函数': 'enterSummary',
+  '入口耗时账本：时间轴标记': '__enterMark',
+  '入口耗时账本：20s 兜底': '\u672A\u51FA\u9996\u5E27',
+  '呈现：离屏合成缓冲': '合成缓冲',
+  '呈现：逐段耗时（真空闲）': '\u771F\u7A7A\u95F2',
+  '耗时账本：记账函数': '__costAdd',
+  '耗时账本：窗口行': '[cost] ',
 };
 for (const [name, needle] of Object.entries(MARK)) {
   check(`romfs/main.js 含 ${name}`, rm.indexOf(needle) >= 0, true);
@@ -161,6 +169,47 @@ check('输入层：软键字符串映射', ri.indexOf("KEY_NAME_TO_CODE['SOFT_LE
 check('输入层：独占绑定 bindExclusive', ri.indexOf('function bindExclusive(idx, code)') > 0, true);
 check('输入层：bindExclusive 已挂到 __keyMap', ri.indexOf('bindExclusive: bindExclusive') > 0, true);
 check('输入层：没夹带 BOM', readFileSync(join(root, 'romfs/host/switch-input.js'))[0] !== 0xEF, true);
+
+// ---- 字体与许可证（perfZ25：换掉不可再分发的 SimHei） ----
+// 背景：旧内置字体 SimHei 的 OS/2.fsType = 8（仅允许嵌入）→ 发布即侵权。
+// 现在内置 SIL OFL 1.1 的 Noto Sans SC，**许可证必须随字体一起打包**（OFL 第 1 条）。
+{
+  const envSrc = readFileSync(join(root, 'src/host/env-prelude.js'), 'utf8');
+  check('字体：package.mjs 拷贝 CJK 字体到 romfs', pkgSrc.indexOf("'fonts/cjk.ttf'") >= 0, true);
+  check('字体：package.mjs 拷贝 OFL 许可证到 romfs', pkgSrc.indexOf("'fonts/OFL.txt'") >= 0, true);
+  check('字体：仓库带 OFL 许可证全文',
+    existsSync(join(root, 'data/fonts/OFL-NotoSansSC.txt')), true);
+  check('字体：许可证是 SIL OFL 1.1',
+    readFileSync(join(root, 'data/fonts/OFL-NotoSansSC.txt'), 'utf8')
+      .indexOf('SIL Open Font License, Version 1.1') >= 0, true);
+  check('字体：字体说明文档在（data/fonts/README.md）',
+    existsSync(join(root, 'data/fonts/README.md')), true);
+  const font = readFileSync(join(root, 'data/fonts/cjk.ttf'));
+  // 真 TTF：sfnt 版本 0x00010000 或 'true'；同时排除 SimHei（Windows 字体不允许再分发）
+  const sfnt = font.readUInt32BE(0);
+  check('字体：是静态 sfnt/TTF（不是 woff/otf-CFF 包装）', sfnt === 0x00010000 || sfnt === 0x74727565, true);
+  check('字体：不含 SimHei 字样（名字表里不许出现）',
+    font.indexOf(Buffer.from('SimHei', 'latin1')) < 0, true);
+  check('字体：大小合理（8~14MB）', font.length > 8e6 && font.length < 14e6, true);
+
+  // ---- perfZ25：原生图像解码（runtime libpng + 线程池）----
+  check('图像：env-prelude 抓原生 Blob 类', envSrc.indexOf('__nativeBlobClass') > 0, true);
+  check('图像：env-prelude 用 createImageBitmap 原生解码',
+    envSrc.indexOf('__nativeCreateImageBitmap') > 0, true);
+  check('图像：原生失败回落纯 JS 解码', envSrc.indexOf('回落 JS') > 0, true);
+  check('图像：我们的 Blob 打了 shim 标记（软重启不误抓）',
+    envSrc.indexOf('__j2meBlobShim') > 0, true);
+  // 格式闸门（安全关键）：runtime 的 decode_png 不做 gray→RGB、不 strip 16bit、
+  // 只对 RGBA 预乘 alpha —— 灰度/16bit/调色板+tRNS 必须回落纯 JS，否则像素错位、
+  // 堆越界或透明边彩边。判定表由 tests/native-png-gate.test.mjs 逐条断言。
+  check('图像：有原生解码格式闸门 __nativePngSafe',
+    envSrc.indexOf('g.__nativePngSafe = nativePngSafe') > 0, true);
+  check('图像：闸门认 tRNS（非预乘 alpha 不走原生）',
+    envSrc.indexOf("pngHasChunk(bytes, 'tRNS')") > 0, true);
+  check('图像：闸门卡位深（16bit 会被 libpng 写越界）',
+    envSrc.indexOf('if (bitDepth !== 8)') > 0, true);
+  check('图像：drawImage 包装层认原生 _bitmap', mainSrc.indexOf('img._bitmap') > 0, true);
+}
 
 console.log(`${passed} passed, ${failed} failed`);
 if (failed) process.exit(1);

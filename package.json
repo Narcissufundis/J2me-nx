@@ -12,7 +12,7 @@
     "build": "node tools/build.mjs",
     "romfs": "node tools/package.mjs",
     "simulate": "node tools/simulate.mjs",
-    "test": "node tests/native-heap.test.mjs && node tests/gbk-table.test.mjs && node tests/samsung-api.test.mjs && node tests/midi-zip-hardening.test.mjs && node tests/mask-assets.test.mjs && node tests/nokia-natives.test.mjs && node tests/panel-layout.test.mjs && node tests/ui-lang.test.mjs && node tools/test-tonebank.mjs && node tools/simulate.mjs && node tools/test-text-ok.mjs && node tools/test-menu.mjs && node tools/test-uilang.mjs && node tools/test-skipfast.mjs && node tools/test-softrestart.mjs && node tools/test-nokia-dg.mjs && node tools/test-samsung-api.mjs && node tools/test-encoding.mjs",
+    "test": "node tests/native-heap.test.mjs && node tests/gbk-table.test.mjs && node tests/samsung-api.test.mjs && node tests/midi-zip-hardening.test.mjs && node tests/mask-assets.test.mjs && node tests/nokia-natives.test.mjs && node tests/native-png-gate.test.mjs && node tests/panel-layout.test.mjs && node tests/ui-lang.test.mjs && node tools/test-tonebank.mjs && node tools/simulate.mjs && node tools/test-text-ok.mjs && node tools/test-menu.mjs && node tools/test-uilang.mjs && node tools/test-skipfast.mjs && node tools/test-softrestart.mjs && node tools/test-nokia-dg.mjs && node tools/test-samsung-api.mjs && node tools/test-encoding.mjs",
     "test:restart": "node tools/test-softrestart.mjs",
     "test:skip": "node tools/fixture/build.mjs && node tools/skip-test/build.mjs && node tools/test-skipfast.mjs",
     "test:uilang": "node tests/ui-lang.test.mjs && node tools/test-uilang.mjs",

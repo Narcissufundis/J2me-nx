@@ -1,7 +1,6 @@
 # 组装快照时**未**进包的东西（由 tools/make-publish.mjs 打印，供复核）
 data/adlmidi/libadlmidi.full.core.wasm（按名排除）
 data/error.log（后缀 .log）
-data/fonts/cjk.ttf（按名排除）
 data/idb-fs.json（按名排除）
 data/java/classes.jar（按名排除）
 data/keys.txt（按名排除）

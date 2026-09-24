@@ -14,7 +14,7 @@ Artifact: `dist/J2me-nx.nro` (Nintendo Switch homebrew, runs under Atmosphère C
 | 操作系统 | Windows / Linux / macOS | 脚本是 Node 写的，与平台无关；本文命令在 Windows 下写成 `node xxx`，Linux/macOS 相同 |
 | Node.js | **18 或更高** | 构建与打包都用它 |
 | JDK | **必须 JDK 8**（javac + jar） | 用来编译 `java/` 下的类库与测试夹具；更高版本 JDK 会因为 `-source 1.3` 报错 |
-| CJK 字体 | **必需**，自己放 | 放到 `data/fonts/cjk.ttf`（中文游戏要它才能显示汉字）。见 `data/fonts/README.md` |
+| CJK 字体 | **已内置**（OFL，可再分发） | 仓库自带 `data/fonts/cjk.ttf`（Noto Sans SC）+ 许可证 `OFL-NotoSansSC.txt`；想换字体见 `data/fonts/README.md` |
 | nx.js 运行时 | `tools/node_modules` 里，`npm install` 自带 | **注意**：官方运行时需要把 `data/nxjs.ini` 里的 `[v8] jit` 改成 `off`，否则启动即崩（见下） |
 | 遮罩素材 | 可选 | 仓库已带默认遮罩 `data/mask.raw`；自定义遮罩放 SD 卡即可，不必进包 |
 
@@ -104,7 +104,8 @@ npm test
    ```
    改完重新 `node tools/package.mjs && npm run nro`。代价是整体更慢，但能跑。
 2. **忘了重跑 tools/build.mjs**：改了 `vendor/` 下的代码只跑 `npm run nro`，补丁不会进包。
-3. **字体**：没用 `data/fonts/cjk.ttf` 时中文会显示成方块（构建阶段就会提示缺文件）。
+3. **字体**：`data/fonts/cjk.ttf` 缺失时中文会显示成方块（构建阶段就会提示缺文件）。仓库已内置
+   Noto Sans SC（SIL OFL 1.1，允许再分发）；换字体时记得连同许可证一起替换。
 
 ---
 
@@ -117,7 +118,7 @@ npm test
 | OS | Windows / Linux / macOS | All scripts are plain Node.js |
 | Node.js | **18 or newer** | Used for building and packaging |
 | JDK | **JDK 8 required** (javac + jar) | Compiles `java/` (class library and test fixtures); newer JDKs reject `-source 1.3` |
-| CJK font | **Required**, you supply it | Put it at `data/fonts/cjk.ttf` (needed to render Chinese text). See `data/fonts/README.md` |
+| CJK font | **Bundled** (OFL, redistributable) | The repo ships `data/fonts/cjk.ttf` (Noto Sans SC) plus its license `OFL-NotoSansSC.txt`; to swap it see `data/fonts/README.md` |
 | nx.js runtime | Comes from `npm install` | **Note**: with the stock runtime you must set `[v8] jit = off` in `data/nxjs.ini`, otherwise it crashes at boot (see below) |
 | Mask assets | Optional | A default mask ships in `data/mask.raw`; custom masks live on the SD card |
 
@@ -214,7 +215,8 @@ panel layout, UI language, and packaged-artifact self-checks. **No console requi
 2. **Forgetting `tools/build.mjs`**: editing anything under `vendor/` and only running
    `npm run nro` leaves your patch out of the artifact.
 3. **Font**: without `data/fonts/cjk.ttf`, Chinese text renders as boxes — and the packaging
-   step fails early with a clear message.
+   step fails early with a clear message. A Noto Sans SC (SIL OFL 1.1, redistributable) is
+   bundled; if you replace it, ship the matching license file too.
 
 ---
 

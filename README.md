@@ -67,8 +67,8 @@ Install: copy `J2me-nx.nro` to `sdmc:/switch/` and your game `.jar` files to `sd
   Only the homebrew (nro) environment on Atmosphère CFW is supported; other loaders/emulators are untested.
 - 目前进游戏前请**手动指定分辨率**（默认自动探测对「万能壳」类游戏可能偏小，会裁掉边缘）。
   For now, set the resolution manually before launching: auto-detection can pick a too-small size for "universal shell" games and crop the edges.
-- 从源码构建需要自备部分第三方资产（CJK 字体等），详见 `BUILD.md` 与 `NOTICE.md`。
-  Building from source requires a few third-party assets you must supply yourself (CJK font, etc.) — see `BUILD.md` and `NOTICE.md`.
+- 从源码构建只需 npm 依赖与 JDK 8：第三方资产里的中文字体（Noto Sans SC，SIL OFL 1.1）已随仓库提供，可直接再分发。
+  Building from source needs only npm dependencies and JDK 8: the CJK font (Noto Sans SC, SIL OFL 1.1) ships with the repo and may be redistributed.
 - 中文支持的是**文本**：游戏里预渲染成图片的文字无法替换或翻译。
   Chinese support applies to text: words baked into images cannot be replaced or translated.
 - MIDI 音色是简化合成，与真机或 ADLMIDI 有差距；个别格式/机型可能无声。
