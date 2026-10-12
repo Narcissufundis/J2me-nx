@@ -1,0 +1,21 @@
+
+name: Build J2me-nx Multi-Game NRO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repository files
+        run: |
+          echo "Repository contents:"
+          ls -la
+          echo "Available build scripts:"
+          find . -maxdepth 3 -type f \
+            \( -name 'package.json' -o -name '*.mjs' \) \
+            -not -path './node_modules/*'
